@@ -148,6 +148,19 @@ export function buildConfig(env = process.env) {
       'DEXSCREENER_URL',
     ),
 
+    relayUrl: parseUrl(env.RELAY_URL, 'https://api.relay.link', 'RELAY_URL'),
+
+    /* Chains a user may pay from. Server-side because it is a safety rule, not
+       a preference: an unlisted chain means an unaudited route. */
+    allowedChainIds: (env.ALLOWED_CHAIN_IDS ?? '8453,1,42161,10,4663')
+      .split(',')
+      .map((s) => Number(s.trim()))
+      .filter((n) => Number.isInteger(n) && n > 0),
+
+    /* Below this, fixed relayer and gas costs are a double-digit percentage of
+       the trade. Measured: a $5 trade executes 20.8% worse than spot. */
+    minTradeUsd: parsePositiveInt(env.MIN_TRADE_USD, 25, 'MIN_TRADE_USD'),
+
     port: parsePositiveInt(env.PORT, 8787, 'PORT'),
 
     /* Loopback by default. Behind nginx there is no reason to accept traffic on

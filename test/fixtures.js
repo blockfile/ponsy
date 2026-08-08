@@ -13,6 +13,17 @@ export const POOL_ADDRESS = '0x8ec038a1868ee77c5a079f56495541b3b0ba0548'
 export const TOKEN_ADDRESS = '0x0c5b5ef209dd8c9c84b6ef2e19c46a48fca0e33e'
 export const WETH_ADDRESS = '0x0bd7d308f8e1639fab988df18a8011f41eacad73'
 
+/**
+ * The real $PONSY contract on Robinhood Chain (chain 4663).
+ *
+ * Deliberately a separate constant from TOKEN_ADDRESS above: that one is a
+ * stats-era fixture standing in for one of twelve tokens on this chain that
+ * also call themselves PONSY, not the genuine contract. The swap quote
+ * service hardcodes the real address as the only valid destination, so its
+ * tests need the real one. Do not "simplify" by consolidating these two.
+ */
+export const PONSY_ADDRESS = '0x2E84F2E0b88BD3FFB5D6738aE0e3C7c00137083E'
+
 /** slot0() — sqrtPriceX96 in word 0, tick 200248 in word 1. */
 export const SLOT0_RETURNDATA =
   '0x' +
