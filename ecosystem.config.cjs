@@ -1,9 +1,14 @@
 /**
  * PM2 process file.
  *
- *   pm2 start ecosystem.config.js
+ *   pm2 start ecosystem.config.cjs
  *   pm2 logs ponsy-stats
  *   pm2 restart ponsy-stats
+ *
+ * The .cjs extension is required, not stylistic. PM2 loads this file with
+ * `require`, but package.json declares "type": "module", which makes every .js
+ * file an ES module where `module.exports` does not exist. The explicit .cjs
+ * extension opts this one file back into CommonJS.
  *
  * Cluster mode would be safe here — the service is stateless and holds no
  * scheduler — but it is pointless: every response is served from a 30s cache

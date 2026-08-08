@@ -57,7 +57,7 @@ fi
 chmod 600 .env
 
 echo "── PM2 (single fork instance) ───────────────────────────────────────────"
-pm2 start ecosystem.config.js --update-env || pm2 restart ponsy-stats
+pm2 start ecosystem.config.cjs --update-env || pm2 restart ponsy-stats
 pm2 save
 pm2 startup systemd -u root --hp /root | tail -1 | bash || true
 

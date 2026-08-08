@@ -135,7 +135,7 @@ npm run probe        # confirms every upstream is reachable from the droplet
 
 ```bash
 cd /var/www/ponsy-stats
-pm2 start ecosystem.config.js
+pm2 start ecosystem.config.cjs
 pm2 save
 pm2 startup systemd -u root --hp /root | tail -1 | sudo bash
 
