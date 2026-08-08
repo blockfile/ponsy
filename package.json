@@ -1,0 +1,19 @@
+{
+  "name": "ponsy-stats-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Live market cap + holders for $PONSY on Robinhood Chain",
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test \"test/**/*.test.js\"",
+    "probe": "node scripts/probe.js"
+  },
+  "dependencies": {
+    "express": "^4.21.2"
+  }
+}

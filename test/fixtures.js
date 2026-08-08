@@ -1,0 +1,122 @@
+/**
+ * FIXTURES
+ * -----------------------------------------------------------------------------
+ * Real upstream responses, captured 2026-08-08 from Robinhood Chain.
+ *
+ * Recorded rather than invented so the decoders are tested against the byte
+ * layout a real node actually returns — hand-written hex tends to encode the
+ * author's belief about the layout, which is the very thing under test.
+ */
+
+/** The PONSY/WETH Uniswap v3 pool. Note token0 is WETH, so PONSY is token1. */
+export const POOL_ADDRESS = '0x8ec038a1868ee77c5a079f56495541b3b0ba0548'
+export const TOKEN_ADDRESS = '0x0c5b5ef209dd8c9c84b6ef2e19c46a48fca0e33e'
+export const WETH_ADDRESS = '0x0bd7d308f8e1639fab988df18a8011f41eacad73'
+
+/** slot0() — sqrtPriceX96 in word 0, tick 200248 in word 1. */
+export const SLOT0_RETURNDATA =
+  '0x' +
+  '00000000000000000000000000000000000057125cd85ddd08d8ad502b600fc2' + // sqrtPriceX96
+  '0000000000000000000000000000000000000000000000000000000000030e38' + // tick 200248
+  '0000000000000000000000000000000000000000000000000000000000000000' + // observationIndex
+  '0000000000000000000000000000000000000000000000000000000000000001' + // cardinality
+  '0000000000000000000000000000000000000000000000000000000000000001' + // cardinalityNext
+  '0000000000000000000000000000000000000000000000000000000000000066' + // feeProtocol
+  '0000000000000000000000000000000000000000000000000000000000000001' // unlocked
+
+export const SQRT_PRICE_X96 = 1766024476635090136263392994791362n
+
+/** token0() -> WETH */
+export const TOKEN0_RETURNDATA =
+  '0x0000000000000000000000000bd7d308f8e1639fab988df18a8011f41eacad73'
+
+/** token1() -> PONSY */
+export const TOKEN1_RETURNDATA =
+  '0x0000000000000000000000000c5b5ef209dd8c9c84b6ef2e19c46a48fca0e33e'
+
+/** totalSupply() -> 1e27 raw = 1,000,000,000 whole tokens at 18 decimals */
+export const TOTAL_SUPPLY_RETURNDATA =
+  '0x0000000000000000000000000000000000000000033b2e3c9fd0803ce8000000'
+
+/** decimals() -> 18 */
+export const DECIMALS_18_RETURNDATA =
+  '0x0000000000000000000000000000000000000000000000000000000000000012'
+
+/** decimals() -> 6 */
+export const DECIMALS_6_RETURNDATA =
+  '0x0000000000000000000000000000000000000000000000000000000000000006'
+
+/** GET /api/v2/tokens/{addr}/counters */
+export const BLOCKSCOUT_COUNTERS = {
+  token_holders_count: '126',
+  transfers_count: '7773',
+}
+
+/** GET /api/v2/stats — trimmed to the fields we read. */
+export const BLOCKSCOUT_STATS = {
+  coin_price: '1919.5',
+  total_blocks: '31018806',
+  average_block_time: 101.0,
+}
+
+/** GET /latest/dex/tokens/{addr} */
+export const DEXSCREENER_TOKENS = {
+  schemaVersion: '1.0.0',
+  pairs: [
+    {
+      chainId: 'robinhood',
+      dexId: 'uniswap',
+      pairAddress: '0x8eC038A1868ee77C5a079f56495541b3b0bA0548',
+      baseToken: { address: TOKEN_ADDRESS, name: 'ponsy', symbol: 'PONSY' },
+      quoteToken: { address: WETH_ADDRESS, name: 'WETH', symbol: 'WETH' },
+      priceNative: '0.000000002012',
+      priceUsd: '0.000003858',
+      liquidity: { usd: 3753.81, base: 825729250, quote: 0.2961 },
+      fdv: 3858,
+      marketCap: 3858,
+    },
+  ],
+}
+
+/**
+ * A fake `fetch` driven by a routing table.
+ *
+ * Each entry is [substring-of-url, handler]. The handler returns either a plain
+ * object (becomes a 200 JSON response) or throws (becomes a network failure).
+ */
+export function stubFetch(routes) {
+  const calls = []
+
+  async function fetchImpl(url, init = {}) {
+    const href = String(url)
+    calls.push({ url: href, init })
+
+    for (const [match, handler] of routes) {
+      if (!href.includes(match)) continue
+
+      const body = init.body ? JSON.parse(init.body) : null
+      const result = await handler(body, href)
+
+      if (result instanceof Error) throw result
+      if (result?.__status && result.__status >= 400) {
+        return { ok: false, status: result.__status, json: async () => ({}) }
+      }
+      return { ok: true, status: 200, json: async () => result }
+    }
+    throw new Error(`stubFetch: no route matched ${href}`)
+  }
+
+  fetchImpl.calls = calls
+  return fetchImpl
+}
+
+/** Builds a JSON-RPC batch reply for the given per-call returndata. */
+export function rpcBatchReply(requests, returndataByIndex) {
+  return requests.map((req, i) => {
+    const data = returndataByIndex[i]
+    if (data instanceof Error) {
+      return { jsonrpc: '2.0', id: req.id, error: { message: data.message } }
+    }
+    return { jsonrpc: '2.0', id: req.id, result: data }
+  })
+}

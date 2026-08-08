@@ -1,0 +1,10 @@
+# Normalise to LF in the repository. This is authored on Windows and deployed to
+# Ubuntu; CRLF that reaches the server breaks shebang lines and nginx configs in
+# ways whose error messages point nowhere near the real cause.
+* text=auto eol=lf
+
+# Never touch binaries.
+*.png binary
+*.jpg binary
+*.webp binary
+*.ico binary
