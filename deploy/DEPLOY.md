@@ -83,28 +83,21 @@ sudo npm install -g pm2
 
 ## Step 2 — Get the code onto the server
 
-**Option A — rsync from Windows** (no GitHub repo needed). From PowerShell in
-`d:\projects\ponsy`, using WSL or Git Bash:
+The code lives at **https://github.com/blockfile/ponsy.git**.
 
 ```bash
-ssh root@152.42.239.56 'mkdir -p /var/www/ponsy-stats'
-rsync -av --delete \
-  --exclude node_modules --exclude .env --exclude .git \
-  ./ root@152.42.239.56:/var/www/ponsy-stats/
-```
-
-**Option B — via git**, if you push this project to a repo first:
-
-```bash
-sudo git clone https://github.com/YOURNAME/ponsy-stats.git /var/www/ponsy-stats
-```
-
-Then install production dependencies:
-
-```bash
+sudo mkdir -p /var/www
+sudo git clone https://github.com/blockfile/ponsy.git /var/www/ponsy-stats
 cd /var/www/ponsy-stats
 npm ci --omit=dev
 ```
+
+`npm ci` (not `npm install`) installs the exact versions in `package-lock.json`,
+so the server runs what was tested rather than whatever is newest that morning.
+`--omit=dev` skips the test-only packages.
+
+If the repo is private, either use a deploy key or push over SSH and clone with
+`git@github.com:blockfile/ponsy.git`.
 
 ---
 
