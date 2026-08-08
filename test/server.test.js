@@ -171,3 +171,85 @@ test('unknown routes 404 as JSON', async () => {
     assert.equal((await res.json()).error, 'not found')
   })
 })
+
+const QUOTE = {
+  amountIn: 0.02, amountOut: 287080.57, amountInUsd: 38.42, amountOutUsd: 36.46,
+  rate: 14354028.5, priceImpact: -0.0512, minReceived: 281338.96, feeUsd: 0.73,
+  timeEstimate: 3, route: 'Base to Robinhood Chain, one transaction',
+  tx: { to: '0x4cd0', data: '0x49290c1c', value: '20000000000000000', chainId: 8453 },
+  requestId: '0xreq', mock: false,
+}
+
+function quoteStub(overrides = {}) {
+  return {
+    getQuote: async () => QUOTE,
+    getStatus: async () => ({ status: 'success' }),
+    ...overrides,
+  }
+}
+
+test('GET /quote returns the normalised quote', async () => {
+  const app = createServer({
+    config: CONFIG,
+    statsService: { collect: async () => PAYLOAD },
+    quoteService: quoteStub(),
+    cache: createCache({ ttlMs: 0, staleMaxMs: 0 }),
+    logger: silent,
+  })
+  const server = app.listen(0)
+  await new Promise((r) => server.once('listening', r))
+  const base = `http://127.0.0.1:${server.address().port}`
+
+  const res = await fetch(
+    `${base}/quote?amount=0.02&chainId=8453&user=0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E`,
+  )
+  const body = await res.json()
+
+  assert.equal(res.status, 200)
+  assert.equal(body.amountOut, 287080.57)
+  assert.equal(body.tx.chainId, 8453)
+  assert.equal(res.headers.get('cache-control'), 'no-store')
+
+  await new Promise((r) => server.close(r))
+})
+
+test('GET /quote returns 400 with the reason when the service rejects', async () => {
+  const app = createServer({
+    config: CONFIG,
+    statsService: { collect: async () => PAYLOAD },
+    quoteService: quoteStub({
+      getQuote: async () => { throw new Error('minimum trade is $25') },
+    }),
+    cache: createCache({ ttlMs: 0, staleMaxMs: 0 }),
+    logger: silent,
+  })
+  const server = app.listen(0)
+  await new Promise((r) => server.once('listening', r))
+  const base = `http://127.0.0.1:${server.address().port}`
+
+  const res = await fetch(`${base}/quote?amount=0.001&chainId=8453&user=0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E`)
+  const body = await res.json()
+
+  assert.equal(res.status, 400)
+  assert.match(body.error, /minimum trade is \$25/)
+
+  await new Promise((r) => server.close(r))
+})
+
+test('GET /quote/status proxies the intent status', async () => {
+  const app = createServer({
+    config: CONFIG,
+    statsService: { collect: async () => PAYLOAD },
+    quoteService: quoteStub(),
+    cache: createCache({ ttlMs: 0, staleMaxMs: 0 }),
+    logger: silent,
+  })
+  const server = app.listen(0)
+  await new Promise((r) => server.once('listening', r))
+  const base = `http://127.0.0.1:${server.address().port}`
+
+  const res = await fetch(`${base}/quote/status?requestId=0xreq`)
+  assert.equal((await res.json()).status, 'success')
+
+  await new Promise((r) => server.close(r))
+})

@@ -43,7 +43,7 @@ function cors(origins) {
  * @param {object} deps.cache         createCache instance
  * @param {object} [deps.logger]
  */
-export function createServer({ config, statsService, cache, logger = console }) {
+export function createServer({ config, statsService, quoteService, cache, logger = console }) {
   const app = express()
   app.disable('x-powered-by')
   app.use(cors(config.corsOrigins))
@@ -94,6 +94,36 @@ export function createServer({ config, statsService, cache, logger = console }) 
         error: 'stats unavailable',
         detail: err.message,
       })
+    }
+  })
+
+  /* Never cached. A quote is a price with an expiry — serving a stale one from
+     any layer is how a user signs a transaction for a number that no longer
+     exists. Note this is the opposite of /stats, which is cached for 30s. */
+  app.get('/quote', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store')
+    try {
+      const quote = await quoteService.getQuote({
+        user: req.query.user,
+        chainId: req.query.chainId,
+        amount: req.query.amount,
+      })
+      res.json(quote)
+    } catch (err) {
+      /* 400, not 500: nearly everything that fails here is the request's fault
+         — an unsupported chain, too small an amount, no route for that pair —
+         and the message is written to be shown to the user as-is. */
+      logger.warn?.('[quote]', err.message)
+      res.status(400).json({ error: err.message })
+    }
+  })
+
+  app.get('/quote/status', async (req, res) => {
+    res.setHeader('Cache-Control', 'no-store')
+    try {
+      res.json(await quoteService.getStatus(req.query.requestId))
+    } catch (err) {
+      res.status(400).json({ error: err.message })
     }
   })
 

@@ -7,6 +7,7 @@
 import { loadEnvFile, buildConfig } from './config.js'
 import { createRpcClient } from './chain/rpc.js'
 import { createStatsService } from './stats.js'
+import { createQuoteService } from './quote.js'
 import { createCache } from './cache.js'
 import { createServer } from './server.js'
 
@@ -34,7 +35,9 @@ const cache = createCache({
   staleMaxMs: config.staleMaxMs,
 })
 
-const app = createServer({ config, statsService, cache })
+const quoteService = createQuoteService({ config })
+
+const app = createServer({ config, statsService, quoteService, cache })
 
 const server = app.listen(config.port, config.host, () => {
   console.log(`[ponsy-stats] listening on ${config.host}:${config.port}`)
