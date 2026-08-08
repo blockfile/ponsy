@@ -40,6 +40,7 @@ function cors(origins) {
  * @param {object} deps
  * @param {object} deps.config
  * @param {object} deps.statsService  createStatsService instance
+ * @param {object} deps.quoteService  createQuoteService instance
  * @param {object} deps.cache         createCache instance
  * @param {object} [deps.logger]
  */

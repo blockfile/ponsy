@@ -8,12 +8,29 @@ import { TOKEN_ADDRESS, POOL_ADDRESS, WETH_ADDRESS } from './fixtures.js'
 
 const silent = { error: () => {}, log: () => {} }
 
-/** Boots the app on an ephemeral port and returns a bound fetch helper. */
-async function withServer({ collect, config }, run) {
+/**
+ * Boots the app on an ephemeral port and returns a bound fetch helper.
+ *
+ * Cleanup (`server.close()`) always runs via `finally`, even if `run` throws
+ * or an assertion inside it fails — a leaked listener from a failed test is
+ * what turns a fast, clear failure into a hung `node --test` process.
+ *
+ * @param {object} opts
+ * @param {Function} opts.collect          stats collector, passed to statsService
+ * @param {object} opts.config
+ * @param {object} [opts.quoteService]     passed straight through to createServer
+ * @param {number} [opts.cacheTtlMs]       overrides config.cacheTtlMs for the stats cache
+ * @param {number} [opts.staleMaxMs]       overrides config.staleMaxMs for the stats cache
+ */
+async function withServer({ collect, config, quoteService, cacheTtlMs, staleMaxMs }, run) {
   const app = createServer({
     config,
     statsService: { collect },
-    cache: createCache({ ttlMs: config.cacheTtlMs, staleMaxMs: config.staleMaxMs }),
+    quoteService,
+    cache: createCache({
+      ttlMs: cacheTtlMs ?? config.cacheTtlMs,
+      staleMaxMs: staleMaxMs ?? config.staleMaxMs,
+    }),
     logger: silent,
   })
 
@@ -189,67 +206,99 @@ function quoteStub(overrides = {}) {
 }
 
 test('GET /quote returns the normalised quote', async () => {
-  const app = createServer({
-    config: CONFIG,
-    statsService: { collect: async () => PAYLOAD },
-    quoteService: quoteStub(),
-    cache: createCache({ ttlMs: 0, staleMaxMs: 0 }),
-    logger: silent,
-  })
-  const server = app.listen(0)
-  await new Promise((r) => server.once('listening', r))
-  const base = `http://127.0.0.1:${server.address().port}`
+  await withServer(
+    {
+      config: CONFIG,
+      collect: async () => PAYLOAD,
+      quoteService: quoteStub(),
+      cacheTtlMs: 0,
+      staleMaxMs: 0,
+    },
+    async (get) => {
+      const res = await get(
+        '/quote?amount=0.02&chainId=8453&user=0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E',
+      )
+      const body = await res.json()
 
-  const res = await fetch(
-    `${base}/quote?amount=0.02&chainId=8453&user=0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E`,
+      assert.equal(res.status, 200)
+      assert.equal(body.amountOut, 287080.57)
+      assert.equal(body.tx.chainId, 8453)
+      assert.equal(res.headers.get('cache-control'), 'no-store')
+    },
   )
-  const body = await res.json()
-
-  assert.equal(res.status, 200)
-  assert.equal(body.amountOut, 287080.57)
-  assert.equal(body.tx.chainId, 8453)
-  assert.equal(res.headers.get('cache-control'), 'no-store')
-
-  await new Promise((r) => server.close(r))
 })
 
 test('GET /quote returns 400 with the reason when the service rejects', async () => {
-  const app = createServer({
-    config: CONFIG,
-    statsService: { collect: async () => PAYLOAD },
-    quoteService: quoteStub({
-      getQuote: async () => { throw new Error('minimum trade is $25') },
-    }),
-    cache: createCache({ ttlMs: 0, staleMaxMs: 0 }),
-    logger: silent,
-  })
-  const server = app.listen(0)
-  await new Promise((r) => server.once('listening', r))
-  const base = `http://127.0.0.1:${server.address().port}`
+  await withServer(
+    {
+      config: CONFIG,
+      collect: async () => PAYLOAD,
+      quoteService: quoteStub({
+        getQuote: async () => { throw new Error('minimum trade is $25') },
+      }),
+      cacheTtlMs: 0,
+      staleMaxMs: 0,
+    },
+    async (get) => {
+      const res = await get(
+        '/quote?amount=0.001&chainId=8453&user=0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E',
+      )
+      const body = await res.json()
 
-  const res = await fetch(`${base}/quote?amount=0.001&chainId=8453&user=0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E`)
-  const body = await res.json()
-
-  assert.equal(res.status, 400)
-  assert.match(body.error, /minimum trade is \$25/)
-
-  await new Promise((r) => server.close(r))
+      assert.equal(res.status, 400)
+      assert.match(body.error, /minimum trade is \$25/)
+      assert.equal(res.headers.get('cache-control'), 'no-store')
+    },
+  )
 })
 
 test('GET /quote/status proxies the intent status', async () => {
-  const app = createServer({
-    config: CONFIG,
-    statsService: { collect: async () => PAYLOAD },
-    quoteService: quoteStub(),
-    cache: createCache({ ttlMs: 0, staleMaxMs: 0 }),
-    logger: silent,
-  })
-  const server = app.listen(0)
-  await new Promise((r) => server.once('listening', r))
-  const base = `http://127.0.0.1:${server.address().port}`
+  /* The route must forward req.query.requestId to the service untouched —
+     a regression that dropped it (eg. forwarding undefined) would otherwise
+     still read 'success' from the stub's fixed return value and ship green. */
+  let receivedRequestId
+  await withServer(
+    {
+      config: CONFIG,
+      collect: async () => PAYLOAD,
+      quoteService: quoteStub({
+        getStatus: async (requestId) => {
+          receivedRequestId = requestId
+          return { status: 'success' }
+        },
+      }),
+      cacheTtlMs: 0,
+      staleMaxMs: 0,
+    },
+    async (get) => {
+      const res = await get('/quote/status?requestId=0xreq')
+      const body = await res.json()
 
-  const res = await fetch(`${base}/quote/status?requestId=0xreq`)
-  assert.equal((await res.json()).status, 'success')
+      assert.equal(body.status, 'success')
+      assert.equal(res.headers.get('cache-control'), 'no-store')
+      assert.equal(receivedRequestId, '0xreq')
+    },
+  )
+})
 
-  await new Promise((r) => server.close(r))
+test('GET /quote/status returns 400 with the reason when the service rejects', async () => {
+  await withServer(
+    {
+      config: CONFIG,
+      collect: async () => PAYLOAD,
+      quoteService: quoteStub({
+        getStatus: async () => { throw new Error('requestId is required') },
+      }),
+      cacheTtlMs: 0,
+      staleMaxMs: 0,
+    },
+    async (get) => {
+      const res = await get('/quote/status')
+      const body = await res.json()
+
+      assert.equal(res.status, 400)
+      assert.equal(body.error, 'requestId is required')
+      assert.equal(res.headers.get('cache-control'), 'no-store')
+    },
+  )
 })
