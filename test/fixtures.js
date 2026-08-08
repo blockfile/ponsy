@@ -99,7 +99,8 @@ export function stubFetch(routes) {
 
       if (result instanceof Error) throw result
       if (result?.__status && result.__status >= 400) {
-        return { ok: false, status: result.__status, json: async () => ({}) }
+        const { __status, ...rest } = result
+        return { ok: false, status: __status, json: async () => rest }
       }
       return { ok: true, status: 200, json: async () => result }
     }
@@ -119,4 +120,71 @@ export function rpcBatchReply(requests, returndataByIndex) {
     }
     return { jsonrpc: '2.0', id: req.id, result: data }
   })
+}
+
+/**
+ * POST /quote — 0.02 ETH on Base -> PONSY on Robinhood Chain.
+ * Captured 2026-08-09. Trimmed to the fields the service reads.
+ */
+export const RELAY_QUOTE = {
+  steps: [
+    {
+      id: 'deposit',
+      kind: 'transaction',
+      requestId: '0x2451e373b348261c1e1d6b6df9f1edc9da51f9f9ca5047b34710b8c5b4',
+      items: [
+        {
+          status: 'incomplete',
+          data: {
+            from: '0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E',
+            to: '0x4cd00e387622c35bddb9b4c962c136462338bc31',
+            data: '0x49290c1c0000000000000000000000002dfec17b1d8dce43cb5b1111352fd58be01d389e',
+            value: '20000000000000000',
+            chainId: 8453,
+            gas: 32713,
+          },
+          check: {
+            endpoint: '/intents/status?requestId=0x2451e373b348261c1e1d6b6df9f1edc9',
+            method: 'GET',
+          },
+        },
+      ],
+    },
+  ],
+  fees: {
+    gas: { amountUsd: '0.000276' },
+    relayer: { amountUsd: '0.730005' },
+    app: { amountUsd: '0' },
+  },
+  details: {
+    operation: 'swap',
+    currencyIn: {
+      currency: { chainId: 8453, symbol: 'ETH', decimals: 18 },
+      amount: '20000000000000000',
+      amountFormatted: '0.02',
+      amountUsd: '38.427738',
+    },
+    currencyOut: {
+      currency: {
+        chainId: 4663,
+        address: '0x2e84f2e0b88bd3ffb5d6738ae0e3c7c00137083e',
+        symbol: 'PONSY',
+        decimals: 18,
+      },
+      amount: '287080575613057682974296',
+      amountFormatted: '287080.575613057682974296',
+      amountUsd: '36.462148',
+      minimumAmount: '281338964100796529311189',
+    },
+    totalImpact: { usd: '-1.965590', percent: '-5.12' },
+    swapImpact: { usd: '-1.235585', percent: '-3.22' },
+    timeEstimate: 3,
+  },
+}
+
+/** GET /intents/status — a completed intent. */
+export const RELAY_STATUS_SUCCESS = {
+  status: 'success',
+  txHashes: ['0xaaa1'],
+  destinationChainId: 4663,
 }
