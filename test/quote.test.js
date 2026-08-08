@@ -2,7 +2,7 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import { buildConfig } from '../src/config.js'
-import { createQuoteService } from '../src/quote.js'
+import { createQuoteService, toWei } from '../src/quote.js'
 import { RELAY_QUOTE, RELAY_STATUS_SUCCESS, PONSY_ADDRESS, stubFetch } from './fixtures.js'
 
 const USER = '0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E'
@@ -38,14 +38,32 @@ test('carries minimum received as whole tokens', async () => {
   assert.ok(q.minReceived < q.amountOut, 'minimum must be below expected')
 })
 
+test('exposes fee, rate, time estimate and route alongside the amounts', async () => {
+  const svc = createQuoteService({ config, fetchImpl: ok() })
+  const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
+
+  // relayer (0.730005) + app (0) — deliberately excludes fees.gas, which the
+  // user's own wallet already shows separately. See the comment in quote.js.
+  assert.equal(q.feeUsd, 0.730005)
+  // Tokens per 1 ETH, derived from amountOut / amountIn.
+  assert.ok(Math.abs(q.rate - 14354028.780652884) < 0.001)
+  assert.equal(q.timeEstimate, 3)
+  assert.equal(q.route, 'Base to Robinhood Chain, one transaction')
+})
+
 test('exposes the transaction to sign and the requestId to poll', async () => {
   const svc = createQuoteService({ config, fetchImpl: ok() })
   const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
 
-  assert.equal(q.tx.to, '0x4cd00e387622c35bddb9b4c962c136462338bc31')
-  assert.equal(q.tx.from, '0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E')
-  assert.equal(q.tx.chainId, 8453)
-  assert.equal(q.tx.value, '20000000000000000')
+  // Full object, including `data` — that's the calldata the wallet actually
+  // signs; a regression that drops or corrupts it must fail this test.
+  assert.deepEqual(q.tx, {
+    from: '0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E',
+    to: '0x4cd00e387622c35bddb9b4c962c136462338bc31',
+    data: '0x49290c1c0000000000000000000000002dfec17b1d8dce43cb5b1111352fd58be01d389e',
+    value: '20000000000000000',
+    chainId: 8453,
+  })
   assert.match(q.requestId, /^0x/)
 })
 
@@ -103,6 +121,28 @@ test('rejects a trade below the USD minimum, naming the minimum', async () => {
   )
 })
 
+test('rejects an unverifiable trade value, distinctly from the minimum message', async () => {
+  const mutations = {
+    'amountUsd missing': (c) => { delete c.amountUsd },
+    'amountUsd is "0"': (c) => { c.amountUsd = '0' },
+    'amountUsd is non-numeric': (c) => { c.amountUsd = 'not-a-number' },
+  }
+  for (const [label, mutate] of Object.entries(mutations)) {
+    const currencyIn = { ...RELAY_QUOTE.details.currencyIn }
+    mutate(currencyIn)
+    const bad = { ...RELAY_QUOTE, details: { ...RELAY_QUOTE.details, currencyIn } }
+    const svc = createQuoteService({
+      config,
+      fetchImpl: stubFetch([['/quote', async () => bad]]),
+    })
+    await assert.rejects(
+      () => svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' }),
+      /could not verify/,
+      label,
+    )
+  }
+})
+
 test('refuses to run when TOKEN_ADDRESS is unset', async () => {
   const svc = createQuoteService({ config: buildConfig({}), fetchImpl: ok() })
   await assert.rejects(
@@ -115,4 +155,25 @@ test('passes status through', async () => {
   const svc = createQuoteService({ config, fetchImpl: ok() })
   const s = await svc.getStatus('0xabc')
   assert.equal(s.status, 'success')
+})
+
+test('toWei converts a decimal ETH string to integer wei', () => {
+  assert.equal(toWei('0.02'), '20000000000000000')
+  assert.equal(toWei('.5'), '500000000000000000')
+  assert.equal(toWei('1.'), '1000000000000000000')
+})
+
+test('toWei rejects malformed input with its own message, distinct from non-positive', () => {
+  // Well-formed but zero magnitude: the "positive number" message applies.
+  assert.throws(() => toWei('0'), /amount must be a positive number/)
+  // Not a valid decimal representation at all: a different message applies,
+  // because reporting these as "must be a positive number" is inaccurate —
+  // toWei never got far enough to evaluate a sign or magnitude.
+  assert.throws(() => toWei('-1'), /amount must be a valid decimal number/)
+  assert.throws(() => toWei('abc'), /amount must be a valid decimal number/)
+  assert.throws(() => toWei(''), /amount must be a valid decimal number/)
+  assert.throws(() => toWei('1e-3'), /amount must be a valid decimal number/)
+  // Well-formed and positive, but more precision than 18 decimals supports:
+  // its own distinct message, unchanged by this fix round.
+  assert.throws(() => toWei('0.' + '1'.repeat(19)), /more than 18 decimal places/)
 })

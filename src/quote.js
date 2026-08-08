@@ -21,7 +21,7 @@ const NATIVE = '0x0000000000000000000000000000000000000000'
 export function toWei(amount, decimals = 18) {
   const s = String(amount).trim()
   if (!/^\d*\.?\d*$/.test(s) || s === '' || s === '.') {
-    throw new Error(`amount must be a positive number, got: ${amount}`)
+    throw new Error(`amount must be a valid decimal number, got: ${amount}`)
   }
   const [whole = '0', frac = ''] = s.split('.')
   if (frac.length > decimals) {
@@ -74,11 +74,24 @@ export function createQuoteService({ config, fetchImpl = fetch }) {
     )
 
     const d = raw?.details ?? {}
-    const inUsd = num(d.currencyIn?.amountUsd)
+
+    /* Fail CLOSED, deliberately. num() maps a missing, "0", or garbled
+       amountUsd to 0, and 0 is not > 0 — reusing num() for this check would
+       let an unverifiable trade value sail through as if it had no minimum
+       at all, defeating the one control this layer exists to enforce. So
+       this parses independently of num() and rejects anything that isn't a
+       usable positive number, with a message distinct from the below-minimum
+       one below so the two failure modes are debuggable apart. Do not
+       "simplify" this back to num(d.currencyIn?.amountUsd) > 0 — that
+       reintroduces the fail-open bug. */
+    const inUsd = Number(d.currencyIn?.amountUsd)
+    if (!Number.isFinite(inUsd) || inUsd <= 0) {
+      throw new Error('could not verify the trade value in USD — refusing to quote')
+    }
 
     /* Checked after quoting rather than before, because the minimum is in USD
        and only Relay knows what the user's ETH is worth right now. */
-    if (inUsd > 0 && inUsd < config.minTradeUsd) {
+    if (inUsd < config.minTradeUsd) {
       throw new Error(
         `minimum trade is $${config.minTradeUsd} — fixed costs would exceed 5% below that`,
       )
@@ -107,6 +120,11 @@ export function createQuoteService({ config, fetchImpl = fetch }) {
       minReceived: d.currencyOut?.minimumAmount
         ? fromRaw(d.currencyOut.minimumAmount, outDecimals)
         : 0,
+      /* relayer + app only — not fees.gas. fees.relayer is already the total
+         of Relay's own relayerGas + relayerService legs (verified against a
+         live quote: 0.648713 + 0.081292 = 0.730005 = fees.relayer), while
+         fees.gas is the origin-chain gas the user's own wallet charges and
+         displays separately. Adding it here would double-count it. */
       feeUsd: num(raw?.fees?.relayer?.amountUsd) + num(raw?.fees?.app?.amountUsd),
       timeEstimate: num(d.timeEstimate),
       route: `${originName(origin)} to Robinhood Chain, one transaction`,
