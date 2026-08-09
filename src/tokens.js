@@ -35,6 +35,12 @@ export const TOKENS_BY_CHAIN = {
   42161: [
     { key: 'native', symbol: 'ETH', address: NATIVE, decimals: 18 },
     { key: 'usdc', symbol: 'USDC', address: '0xaf88d065e77c8cC2239327C5EDb3A432268e5831', decimals: 6 },
+    // Address is canonical Tether USDT on Arbitrum. Tether migrated this
+    // contract in place to the USDT0 cross-chain standard (Jan 2025), so
+    // on-chain symbol()/name() now read "USD₮0" — that mismatch is expected,
+    // not a sign the address is wrong. symbol: 'USDT' is still the right
+    // label to show users. (BNB USDT below has a similar cosmetic mismatch:
+    // BscScan labels it "Binance-Peg BSC-USD" while symbol() returns USDT.)
     { key: 'usdt', symbol: 'USDT', address: '0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9', decimals: 6 },
   ],
   10: [
