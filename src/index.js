@@ -4,7 +4,7 @@
  * Loads config, wires the pieces together, starts listening.
  */
 
-import { loadEnvFile, buildConfig } from './config.js'
+import { loadEnvFile, buildConfig, waitBudgetWarning } from './config.js'
 import { createRpcClient } from './chain/rpc.js'
 import { createBlockhashProvider } from './chain/solana.js'
 import { createStatsService } from './stats.js'
@@ -12,12 +12,6 @@ import { createQuoteService } from './quote.js'
 import { createCache } from './cache.js'
 import { createRefresher } from './refresher.js'
 import { createServer } from './server.js'
-
-/* Mirrors `proxy_read_timeout` in deploy/nginx.conf. Duplicated here on
-   purpose: nginx's config is not readable from Node, and the whole point of
-   the check below is that these two numbers live in different files and have
-   twice been changed independently into a 504. Change both together. */
-const NGINX_PROXY_READ_TIMEOUT_MS = 15_000
 
 loadEnvFile()
 
@@ -53,7 +47,17 @@ const refresher = createRefresher({
   intervalMs: config.refreshIntervalMs,
 })
 
-const blockhash = createBlockhashProvider({ rpcUrl: config.solanaRpcUrl })
+/* timeoutMs is passed explicitly rather than left to the provider's own
+   default. Both upstream calls on the /quote path now run concurrently, so
+   the worst case is max(relay, blockhash) — but that is only true if the two
+   budgets actually track each other. Leaving blockhash on a separate
+   hardcoded constant meant raising UPSTREAM_TIMEOUT_MS silently widened the
+   gap between them, which is exactly the kind of drift between two numbers
+   in two files that caused this project's 504 twice. */
+const blockhash = createBlockhashProvider({
+  rpcUrl: config.solanaRpcUrl,
+  timeoutMs: config.upstreamTimeoutMs,
+})
 const quoteService = createQuoteService({ config, blockhash })
 
 const app = createServer({ config, statsService, quoteService, cache })
@@ -77,27 +81,10 @@ const server = app.listen(config.port, config.host, () => {
   )
   console.log(`[ponsy-stats] waits      stats ${config.statsWaitMs}ms · quote ${config.quoteWaitMs}ms`)
 
-  /* This project has had the SAME outage twice: a wait budget that outlived
-     nginx's proxy_read_timeout, so nginx returned a 504 over a request that
-     was about to succeed. Both times the composition was only visible by
-     reading two files that nobody reads together — an env var here and a
-     directive in deploy/nginx.conf.
-
-     Node cannot read nginx's config, so this warns rather than throws: an
-     operator who has genuinely raised proxy_read_timeout is not doing
-     anything wrong, and refusing to boot over an assumption would be worse
-     than the outage. It prints the actual numbers and names the file to
-     change, because the failure it prevents is silent, intermittent, and
-     reads like an upstream problem rather than a config one. */
-  const budget = Math.max(config.statsWaitMs, config.quoteWaitMs)
-  if (budget >= NGINX_PROXY_READ_TIMEOUT_MS) {
-    console.warn(
-      `[ponsy-stats] WARNING: a wait budget of ${budget}ms meets or exceeds the ` +
-        `${NGINX_PROXY_READ_TIMEOUT_MS}ms proxy_read_timeout in deploy/nginx.conf. ` +
-        `nginx will 504 before this server answers. Lower STATS_WAIT_MS / ` +
-        `QUOTE_WAIT_MS, or raise proxy_read_timeout to match.`,
-    )
-  }
+  /* See waitBudgetWarning() in config.js for why this warns rather than
+     throws, and why the check lives there rather than inline here. */
+  const warning = waitBudgetWarning(config)
+  if (warning) console.warn(`[ponsy-stats] WARNING: ${warning}`)
 })
 
 /* Containers stop with SIGTERM; without this the platform waits out its grace

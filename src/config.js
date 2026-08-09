@@ -215,3 +215,42 @@ export function buildConfig(env = process.env) {
     quoteWaitMs: parsePositiveInt(env.QUOTE_WAIT_MS, 12_000, 'QUOTE_WAIT_MS'),
   })
 }
+
+/* Mirrors `proxy_read_timeout` in deploy/nginx.conf. Duplicated here on
+   purpose: nginx's config is not readable from Node, and the whole point of
+   the check below is that these two numbers live in different files and have
+   twice been changed independently into a 504. Change both together. */
+export const NGINX_PROXY_READ_TIMEOUT_MS = 15_000
+
+/**
+ * Returns a warning string when a wait budget outlives nginx's read timeout,
+ * or null when the config is safe.
+ *
+ * This project has had the SAME outage twice: a wait budget that outlived
+ * nginx's proxy_read_timeout, so nginx returned a 504 over a request that was
+ * about to succeed. Both times the composition was only visible by reading two
+ * files nobody reads together — an env var here and a directive in
+ * deploy/nginx.conf.
+ *
+ * Warns rather than throws: Node cannot read nginx's config, and an operator
+ * who has genuinely raised proxy_read_timeout is not doing anything wrong.
+ * Refusing to boot over that assumption would be worse than the outage it
+ * prevents. The message carries the actual numbers and names the file to
+ * change, because the failure it prevents is silent, intermittent, and reads
+ * like an upstream problem rather than a config one.
+ *
+ * A pure function returning a string rather than a console.warn() inside the
+ * listen callback, so the one safety net against a third recurrence is
+ * testable — review found it had no coverage precisely because it was
+ * unreachable from a test.
+ */
+export function waitBudgetWarning(config, ceilingMs = NGINX_PROXY_READ_TIMEOUT_MS) {
+  const budget = Math.max(config.statsWaitMs, config.quoteWaitMs)
+  if (budget < ceilingMs) return null
+  return (
+    `a wait budget of ${budget}ms meets or exceeds the ${ceilingMs}ms ` +
+    `proxy_read_timeout in deploy/nginx.conf. nginx will 504 before this ` +
+    `server answers. Lower STATS_WAIT_MS / QUOTE_WAIT_MS, or raise ` +
+    `proxy_read_timeout to match.`
+  )
+}

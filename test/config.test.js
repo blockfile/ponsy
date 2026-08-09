@@ -1,7 +1,13 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 
-import { buildConfig, parseAddress } from '../src/config.js'
+import {
+  buildConfig,
+  parseAddress,
+  waitBudgetWarning,
+  NGINX_PROXY_READ_TIMEOUT_MS,
+} from '../src/config.js'
 import { TOKEN_ADDRESS } from './fixtures.js'
 
 test('an unset address is null, not an error', () => {
@@ -85,4 +91,69 @@ test('REFRESH_INTERVAL_MS and STATS_WAIT_MS are configurable', () => {
   const config = buildConfig({ REFRESH_INTERVAL_MS: '5000', STATS_WAIT_MS: '1000' })
   assert.equal(config.refreshIntervalMs, 5000)
   assert.equal(config.statsWaitMs, 1000)
+})
+
+test('the quote wait budget defaults to 12s and is configurable', () => {
+  assert.equal(buildConfig({}).quoteWaitMs, 12000)
+  assert.equal(buildConfig({ QUOTE_WAIT_MS: '9000' }).quoteWaitMs, 9000)
+})
+
+/* The default config must not itself trip the warning — if it did, every
+   operator would see it on every boot and learn to ignore the one message
+   that prevents this project's twice-repeated outage. */
+test('the shipped defaults stay under nginx proxy_read_timeout', () => {
+  const config = buildConfig({})
+  assert.ok(config.statsWaitMs < NGINX_PROXY_READ_TIMEOUT_MS)
+  assert.ok(config.quoteWaitMs < NGINX_PROXY_READ_TIMEOUT_MS)
+  assert.equal(waitBudgetWarning(config), null)
+})
+
+test('a wait budget at or over nginx proxy_read_timeout warns, naming both numbers', () => {
+  const warning = waitBudgetWarning({ statsWaitMs: 5000, quoteWaitMs: 20000 })
+  assert.ok(warning, 'a 20s quote budget against a 15s ceiling must warn')
+  assert.match(warning, /20000ms/)
+  assert.match(warning, /15000ms/)
+  assert.match(warning, /proxy_read_timeout/)
+  assert.match(warning, /deploy\/nginx\.conf/)
+})
+
+/* Either budget alone can exceed the ceiling — the check takes the max, not
+   the quote budget it was written for. */
+test('the stats budget alone can trip the warning', () => {
+  assert.ok(waitBudgetWarning({ statsWaitMs: 16000, quoteWaitMs: 1000 }))
+})
+
+/* Boundary: 'meets OR exceeds'. A budget exactly equal to the ceiling leaves
+   zero margin for nginx's own overhead, so it warns. */
+test('the warning fires exactly at the ceiling, not just above it', () => {
+  const at = NGINX_PROXY_READ_TIMEOUT_MS
+  assert.ok(waitBudgetWarning({ statsWaitMs: 0, quoteWaitMs: at }))
+  assert.equal(waitBudgetWarning({ statsWaitMs: 0, quoteWaitMs: at - 1 }), null)
+})
+
+/* An operator who raises proxy_read_timeout in nginx is not doing anything
+   wrong, and must be able to say so without the warning crying wolf. */
+test('a raised ceiling silences the warning', () => {
+  assert.ok(waitBudgetWarning({ statsWaitMs: 0, quoteWaitMs: 20000 }))
+  assert.equal(waitBudgetWarning({ statsWaitMs: 0, quoteWaitMs: 20000 }, 30000), null)
+})
+
+/* Reads the real deploy/nginx.conf rather than asserting the constant equals
+   itself. The whole failure mode this guards is two numbers drifting apart in
+   two files, so a test that only looks at one file would reproduce the bug
+   rather than catch it: change nginx to 10s and every other test here still
+   passes while production silently 504s again. */
+test('the mirrored ceiling matches proxy_read_timeout in deploy/nginx.conf', () => {
+  const conf = readFileSync(
+    new URL('../deploy/nginx.conf', import.meta.url),
+    'utf8',
+  )
+  const match = conf.match(/proxy_read_timeout\s+(\d+)(m?s);/)
+  assert.ok(match, 'deploy/nginx.conf must declare a proxy_read_timeout')
+  const ms = match[2] === 's' ? Number(match[1]) * 1000 : Number(match[1])
+  assert.equal(
+    NGINX_PROXY_READ_TIMEOUT_MS,
+    ms,
+    'NGINX_PROXY_READ_TIMEOUT_MS in config.js has drifted from deploy/nginx.conf — change both together',
+  )
 })
