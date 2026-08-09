@@ -67,6 +67,30 @@ test('exposes the transaction to sign and the requestId to poll', async () => {
   assert.match(q.requestId, /^0x/)
 })
 
+test('rejects a Relay response with no sending account for the transaction', async () => {
+  // Both the wallet's own account check and the frontend's `if (from && ...)`
+  // guard depend on this field existing — a missing `from` must fail here,
+  // not silently reach either of those and pass them by omission.
+  const { from, ...dataWithoutFrom } = RELAY_QUOTE.steps[0].items[0].data
+  const noFrom = {
+    ...RELAY_QUOTE,
+    steps: [
+      {
+        ...RELAY_QUOTE.steps[0],
+        items: [{ ...RELAY_QUOTE.steps[0].items[0], data: dataWithoutFrom }],
+      },
+    ],
+  }
+  const svc = createQuoteService({
+    config,
+    fetchImpl: stubFetch([['/quote', async () => noFrom]]),
+  })
+  await assert.rejects(
+    () => svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' }),
+    /no sending account/,
+  )
+})
+
 test('sends the hardcoded PONSY address, never one from the caller', async () => {
   const fetchImpl = ok()
   const svc = createQuoteService({ config, fetchImpl })

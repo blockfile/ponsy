@@ -105,6 +105,15 @@ export function createQuoteService({ config, fetchImpl = fetch }) {
     if (!item?.data?.to) {
       throw new Error('Relay returned no transaction to sign')
     }
+    /* `from` is forwarded to the frontend and relied on by two independent
+       downstream guards: the wallet only gets to validate its selected
+       account against a `from` that actually exists on `tx`, and the
+       frontend's own account-match check (`if (from && ...)`) skips
+       entirely when `from` is absent — silently, not fail-closed. Refuse
+       here rather than let a Relay response with no `from` defeat both. */
+    if (!item?.data?.from) {
+      throw new Error('Relay returned no sending account for the transaction')
+    }
 
     return {
       amountIn,
