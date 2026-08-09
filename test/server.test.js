@@ -308,6 +308,94 @@ test('GET /quote returns 400 with the reason when the service rejects', async ()
   )
 })
 
+test('GET /quote forwards recipient from the query string verbatim', async () => {
+  // A Solana origin cannot derive its destination from the payer, so this
+  // query parameter has to survive the HTTP layer untouched — pin the value
+  // the service actually receives, not just that the route returns 200.
+  let received
+  await withServer(
+    {
+      config: CONFIG,
+      collect: async () => PAYLOAD,
+      quoteService: quoteStub({
+        getQuote: async (args) => {
+          received = args
+          return QUOTE
+        },
+      }),
+      cacheTtlMs: 0,
+      staleMaxMs: 0,
+    },
+    async (get) => {
+      const res = await get(
+        '/quote?amount=0.25&chainId=792703809&user=GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ&recipient=0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E',
+      )
+      assert.equal(res.status, 200)
+      assert.equal(received.recipient, '0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E')
+    },
+  )
+})
+
+test('GET /quote forwards a missing recipient as undefined, not "" or null', async () => {
+  // getQuote's own recipient-defaulting (EVM: falls back to user) and
+  // Solana validation (ADDRESS_RE.test(String(recipient ?? ''))) both depend
+  // on genuinely receiving undefined here. Express never produces '' for an
+  // absent query param, but this pins the value the route actually passes
+  // through rather than assuming Express's behaviour.
+  let received
+  await withServer(
+    {
+      config: CONFIG,
+      collect: async () => PAYLOAD,
+      quoteService: quoteStub({
+        getQuote: async (args) => {
+          received = args
+          return QUOTE
+        },
+      }),
+      cacheTtlMs: 0,
+      staleMaxMs: 0,
+    },
+    async (get) => {
+      const res = await get(
+        '/quote?amount=0.02&chainId=8453&user=0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E',
+      )
+      assert.equal(res.status, 200)
+      assert.equal(received.recipient, undefined)
+    },
+  )
+})
+
+test('GET /quote returns 400 when the service rejects a Solana quote for a missing recipient', async () => {
+  // Same passthrough mechanism as the existing 400 test above, exercised
+  // with the specific error a Solana origin produces when recipient is
+  // absent — confirms the new failure mode reaches the caller exactly like
+  // every other quote rejection, not as a special case.
+  await withServer(
+    {
+      config: CONFIG,
+      collect: async () => PAYLOAD,
+      quoteService: quoteStub({
+        getQuote: async () => {
+          throw new Error('recipient must be a 0x address when paying from Solana')
+        },
+      }),
+      cacheTtlMs: 0,
+      staleMaxMs: 0,
+    },
+    async (get) => {
+      const res = await get(
+        '/quote?amount=0.25&chainId=792703809&user=GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ',
+      )
+      const body = await res.json()
+
+      assert.equal(res.status, 400)
+      assert.match(body.error, /recipient must be a 0x address/)
+      assert.equal(res.headers.get('cache-control'), 'no-store')
+    },
+  )
+})
+
 test('GET /quote/status proxies the intent status', async () => {
   /* The route must forward req.query.requestId to the service untouched —
      a regression that dropped it (eg. forwarding undefined) would otherwise

@@ -409,6 +409,26 @@ test('still emits marketCap-style shared fields for a Solana quote', async () =>
   assert.match(q.requestId, /^0x/)
 })
 
+test('the $25 minimum is not bypassed for a Solana origin', async () => {
+  // Uses the shared, real `config` (the $25 production default) rather than
+  // solanaTestConfig() — this is the one test in this file that must NOT
+  // lower the minimum, because its entire point is to prove the gate still
+  // fires on this path. RELAY_SOLANA_QUOTE is a genuine captured trade
+  // (~$19: see currencyIn.amountUsd in fixtures.js) that is honestly below
+  // $25, not a fixture altered to dodge the check.
+  const svc = createQuoteService({
+    config,
+    fetchImpl: stubFetch([['/quote', async () => RELAY_SOLANA_QUOTE]]),
+    blockhash: stubBlockhash,
+  })
+  await assert.rejects(
+    () => svc.getQuote({
+      user: SOL_PAYER, chainId: SOLANA_CHAIN, amount: '0.25', recipient: EVM_RECIPIENT,
+    }),
+    /minimum trade is \$25/,
+  )
+})
+
 test('toLamports converts a decimal SOL string to integer lamports, at 9 decimals', () => {
   // Mirrors toWei's own pinning test, at SOL's 9 decimals instead of 18 —
   // 0.25 SOL is exactly the 250000000 lamports the live fixture captures.

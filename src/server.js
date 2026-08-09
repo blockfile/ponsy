@@ -163,6 +163,7 @@ export function createServer({ config, statsService, quoteService, cache, logger
         user: req.query.user,
         chainId: req.query.chainId,
         amount: req.query.amount,
+        recipient: req.query.recipient,
       })
       res.json(quote)
     } catch (err) {
