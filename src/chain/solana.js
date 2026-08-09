@@ -22,11 +22,16 @@
 
 import { PublicKey, Transaction, TransactionInstruction } from '@solana/web3.js'
 
-const HEX_RE = /^[0-9a-fA-F]*$/
+/* `+`, not `*`: an empty string must fail this test on its own. Combined with
+   dropping the old `?? ''` fallback below, a missing, null, or renamed `data`
+   field from Relay throws here instead of silently becoming a zero-byte
+   instruction — one that looks valid, gets signed, and only fails on-chain
+   after the user has already approved it. */
+const HEX_RE = /^[0-9a-fA-F]+$/
 
 /** Relay sends instruction data as hex with no 0x prefix. */
 function decodeData(hex) {
-  const s = String(hex ?? '')
+  const s = String(hex)
   if (!HEX_RE.test(s) || s.length % 2 !== 0) {
     throw new Error(`instruction data must be even-length hex, got: ${s.slice(0, 24)}`)
   }
@@ -46,12 +51,20 @@ export function buildSolanaTransaction({ instructions, feePayer, blockhash }) {
   }
   if (!blockhash) throw new Error('a recent blockhash is required')
 
+  const feePayerKey = new PublicKey(feePayer)
+
   const tx = new Transaction()
   for (const raw of instructions) {
+    /* A missing or empty `keys` is the same class of problem as missing
+       `data`: a structurally valid-looking instruction that touches no
+       accounts, guaranteed to fail on-chain after the user has approved it. */
+    if (!Array.isArray(raw.keys) || raw.keys.length === 0) {
+      throw new Error('instruction keys must be a non-empty array')
+    }
     tx.add(
       new TransactionInstruction({
         programId: new PublicKey(raw.programId),
-        keys: (raw.keys ?? []).map((k) => ({
+        keys: raw.keys.map((k) => ({
           pubkey: new PublicKey(k.pubkey),
           isSigner: Boolean(k.isSigner),
           isWritable: Boolean(k.isWritable),
@@ -61,7 +74,19 @@ export function buildSolanaTransaction({ instructions, feePayer, blockhash }) {
     )
   }
 
-  tx.feePayer = new PublicKey(feePayer)
+  /* Relay is expected to name the fee payer as a signer among the
+     instructions' own keys. If it doesn't, the compiled message ends up
+     requiring a signature the wallet was never shown a reason to give, and
+     the mismatch would otherwise surface only after the user has approved
+     the prompt, as an opaque RPC rejection rather than a caught error here. */
+  const feePayerIsSigner = instructions.some((raw) =>
+    raw.keys.some((k) => Boolean(k.isSigner) && k.pubkey === feePayer),
+  )
+  if (!feePayerIsSigner) {
+    throw new Error(`feePayer ${feePayer} is not declared as a signer in any instruction`)
+  }
+
+  tx.feePayer = feePayerKey
   tx.recentBlockhash = blockhash
 
   /* Unsigned by construction — the wallet signs. Serialising without that
@@ -89,10 +114,7 @@ export function createBlockhashProvider({
   let storedAt = 0
   let inFlight = null
 
-  async function fetchOne(signal) {
-    const signals = [AbortSignal.timeout(timeoutMs)]
-    if (signal) signals.push(signal)
-
+  async function fetchOne() {
     const res = await fetchImpl(rpcUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -102,7 +124,15 @@ export function createBlockhashProvider({
         method: 'getLatestBlockhash',
         params: [{ commitment: 'confirmed' }],
       }),
-      signal: AbortSignal.any(signals),
+      /* Bounded only by timeoutMs — deliberately never by a caller's own
+         AbortSignal. This fetch is shared: every concurrent caller is
+         coalesced onto the one in-flight request, so wiring a per-caller
+         signal in here would mean one visitor closing their tab cancels the
+         blockhash everyone else concurrently waiting is depending on.
+         Per-caller give-up is handled at the get() boundary below instead,
+         without touching the shared request. Do not "fix" this by threading
+         a signal back in. */
+      signal: AbortSignal.timeout(timeoutMs),
     })
     if (!res.ok) throw new Error(`Solana RPC HTTP ${res.status}`)
 
@@ -112,10 +142,12 @@ export function createBlockhashProvider({
     const value = json?.result?.value
     if (!value?.blockhash) throw new Error('Solana RPC returned no blockhash')
 
-    return {
+    /* Frozen because this same object is handed to every caller sharing the
+       cache — one caller mutating it would corrupt what everyone else reads. */
+    return Object.freeze({
       blockhash: value.blockhash,
       lastValidBlockHeight: value.lastValidBlockHeight ?? null,
-    }
+    })
   }
 
   async function get({ signal } = {}) {
@@ -124,7 +156,7 @@ export function createBlockhashProvider({
     if (!inFlight) {
       inFlight = (async () => {
         try {
-          cached = await fetchOne(signal)
+          cached = await fetchOne()
           storedAt = now()
           return cached
         } finally {
@@ -132,7 +164,19 @@ export function createBlockhashProvider({
         }
       })()
     }
-    return inFlight
+    const shared = inFlight
+
+    if (!signal) return shared
+
+    /* Race this caller's own signal against the shared fetch instead of
+       passing it into fetchOne — giving up must stop only this call from
+       waiting, not cancel the request every other caller is joined on. */
+    if (signal.aborted) throw signal.reason ?? new Error('aborted')
+    return new Promise((resolve, reject) => {
+      const onAbort = () => reject(signal.reason ?? new Error('aborted'))
+      signal.addEventListener('abort', onAbort, { once: true })
+      shared.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort))
+    })
   }
 
   return { get }

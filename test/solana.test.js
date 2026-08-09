@@ -29,6 +29,19 @@ test('serialises to base64 that round-trips back to the same instruction', async
   assert.equal(tx.feePayer.toBase58(), SOL_PAYER)
 })
 
+test('the output is unsigned — one signature slot, sixty-four zero bytes', () => {
+  const b64 = buildSolanaTransaction({
+    instructions: INSTRUCTIONS, feePayer: SOL_PAYER, blockhash: SOL_BLOCKHASH,
+  })
+  const raw = Buffer.from(b64, 'base64')
+
+  /* This is the property the file exists to guarantee — the backend must
+     never hold a key — made explicit rather than left implicit in the other
+     tests. */
+  assert.equal(raw[0], 1, 'compact-u16 signature count')
+  assert.ok(raw.subarray(1, 65).every((b) => b === 0), 'the signature slot must be all zero, not a real signature')
+})
+
 test('preserves account order exactly — position is what the program indexes on', async () => {
   const { Transaction } = await import('@solana/web3.js')
   const b64 = buildSolanaTransaction({
@@ -90,16 +103,53 @@ test('rejects data that is not clean hex rather than silently truncating', () =>
   )
 })
 
+test('rejects odd-length hex rather than misreading the byte boundary', () => {
+  const bad = [{ ...INSTRUCTIONS[0], data: 'abc' }]
+  assert.throws(
+    () => buildSolanaTransaction({ instructions: bad, feePayer: SOL_PAYER, blockhash: SOL_BLOCKHASH }),
+    /hex/i,
+  )
+})
+
+test('rejects missing or empty instruction data rather than building a zero-byte instruction', () => {
+  for (const missing of [null, undefined, '']) {
+    const bad = [{ ...INSTRUCTIONS[0], data: missing }]
+    assert.throws(
+      () => buildSolanaTransaction({ instructions: bad, feePayer: SOL_PAYER, blockhash: SOL_BLOCKHASH }),
+      /hex/i,
+    )
+  }
+})
+
 test('rejects a malformed base58 pubkey', () => {
   const bad = [{ ...INSTRUCTIONS[0], programId: 'not-a-real-pubkey!!!' }]
   assert.throws(() =>
     buildSolanaTransaction({ instructions: bad, feePayer: SOL_PAYER, blockhash: SOL_BLOCKHASH }))
 })
 
+test('rejects an instruction with no keys rather than building a zero-account instruction', () => {
+  const bad = [{ ...INSTRUCTIONS[0], keys: undefined }]
+  assert.throws(
+    () => buildSolanaTransaction({ instructions: bad, feePayer: SOL_PAYER, blockhash: SOL_BLOCKHASH }),
+    /keys/i,
+  )
+})
+
 test('requires at least one instruction', () => {
   assert.throws(
     () => buildSolanaTransaction({ instructions: [], feePayer: SOL_PAYER, blockhash: SOL_BLOCKHASH }),
     /instruction/i,
+  )
+})
+
+test('rejects a feePayer that is not declared as a signer in any instruction', () => {
+  /* Index 3 of the fixture (7uTT8Xi...) is a real key in this instruction,
+     just not one Relay marked isSigner:true — the boundary this check exists
+     to catch, as opposed to a pubkey absent from the instruction entirely. */
+  const notASigner = INSTRUCTIONS[0].keys[3].pubkey
+  assert.throws(
+    () => buildSolanaTransaction({ instructions: INSTRUCTIONS, feePayer: notASigner, blockhash: SOL_BLOCKHASH }),
+    /signer/i,
   )
 })
 
