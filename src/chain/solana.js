@@ -22,20 +22,28 @@
 
 import { PublicKey, Transaction, TransactionInstruction } from '@solana/web3.js'
 
-/* `+`, not `*`: an empty string must fail this test on its own. Combined with
-   dropping the old `?? ''` fallback below, a missing, null, or renamed `data`
-   field from Relay throws here instead of silently becoming a zero-byte
-   instruction — one that looks valid, gets signed, and only fails on-chain
-   after the user has already approved it. */
-const HEX_RE = /^[0-9a-fA-F]+$/
+/* `*`, not `+`: a genuinely empty instruction data is legal on Solana — e.g.
+   the SPL Associated Token Account program's legacy Create instruction takes
+   zero bytes of data — so the charset test must not reject an empty string.
+   The bug here was never "empty data can exist"; it was "a missing/null
+   field silently BECOMES empty" via unchecked coercion. That is closed by
+   the explicit `typeof hex !== 'string'` check in decodeData below, not by
+   narrowing this regex. Do not change this back to `+` — that rejects any
+   real, zero-byte-data instruction Relay legitimately sends. */
+const HEX_RE = /^[0-9a-fA-F]*$/
 
-/** Relay sends instruction data as hex with no 0x prefix. */
+/**
+ * Relay sends instruction data as hex with no 0x prefix. Empty data (zero
+ * bytes) is legal and accepted. Rejected: anything that is not a string
+ * (including numbers or arrays that would otherwise silently stringify into
+ * something hex-shaped — `String(12)` is `'12'`, `String(['ab'])` is `'ab'`),
+ * anything with characters outside the hex charset, and odd length.
+ */
 function decodeData(hex) {
-  const s = String(hex)
-  if (!HEX_RE.test(s) || s.length % 2 !== 0) {
-    throw new Error(`instruction data must be even-length hex, got: ${s.slice(0, 24)}`)
+  if (typeof hex !== 'string' || !HEX_RE.test(hex) || hex.length % 2 !== 0) {
+    throw new Error(`instruction data must be an even-length hex string, got: ${String(hex).slice(0, 24)}`)
   }
-  return Buffer.from(s, 'hex')
+  return Buffer.from(hex, 'hex')
 }
 
 /**
@@ -55,11 +63,12 @@ export function buildSolanaTransaction({ instructions, feePayer, blockhash }) {
 
   const tx = new Transaction()
   for (const raw of instructions) {
-    /* A missing or empty `keys` is the same class of problem as missing
-       `data`: a structurally valid-looking instruction that touches no
-       accounts, guaranteed to fail on-chain after the user has approved it. */
-    if (!Array.isArray(raw.keys) || raw.keys.length === 0) {
-      throw new Error('instruction keys must be a non-empty array')
+    /* Reject the wrong shape (missing, null, not an array), not emptiness —
+       a genuinely empty accounts list is legal on Solana (the Memo program
+       takes zero accounts), so only non-arrays are rejected here, mirroring
+       decodeData's stance on empty vs. wrong-typed `data` above. */
+    if (!Array.isArray(raw.keys)) {
+      throw new Error('instruction keys must be an array')
     }
     tx.add(
       new TransactionInstruction({
@@ -78,12 +87,17 @@ export function buildSolanaTransaction({ instructions, feePayer, blockhash }) {
      instructions' own keys. If it doesn't, the compiled message ends up
      requiring a signature the wallet was never shown a reason to give, and
      the mismatch would otherwise surface only after the user has approved
-     the prompt, as an opaque RPC rejection rather than a caught error here. */
-  const feePayerIsSigner = instructions.some((raw) =>
-    raw.keys.some((k) => Boolean(k.isSigner) && k.pubkey === feePayer),
+     the prompt, as an opaque RPC rejection rather than a caught error here.
+     Compared via PublicKey#equals on the already-constructed keys in `tx`,
+     not raw string identity — a feePayer passed as a PublicKey instance
+     rather than a base58 string would never string-match, and the error
+     below (which reports the canonical base58 either way) would then read
+     as a genuine mismatch when it is really just a type difference. */
+  const feePayerIsSigner = tx.instructions.some((instr) =>
+    instr.keys.some((k) => k.isSigner && k.pubkey.equals(feePayerKey)),
   )
   if (!feePayerIsSigner) {
-    throw new Error(`feePayer ${feePayer} is not declared as a signer in any instruction`)
+    throw new Error(`feePayer ${feePayerKey.toBase58()} is not declared as a signer in any instruction`)
   }
 
   tx.feePayer = feePayerKey
@@ -151,6 +165,17 @@ export function createBlockhashProvider({
   }
 
   async function get({ signal } = {}) {
+    /* Checked first — before the shared fetch is created or joined at all.
+       Checking this later (after capturing `shared`) meant a pre-aborted
+       caller would still start or join the in-flight fetch, then throw
+       synchronously and walk away without attaching a handler to it. If
+       that orphaned promise later rejected — RPC error, non-2xx, timeout,
+       missing blockhash — nothing was left to handle it, and Node's default
+       --unhandled-rejections=throw took the whole process down. Checking up
+       front means a caller who has already given up neither starts an RPC
+       round trip nor leaves anything unhandled behind. */
+    if (signal?.aborted) throw signal.reason ?? new Error('aborted')
+
     if (cached && now() - storedAt < ttlMs) return cached
 
     if (!inFlight) {
@@ -171,7 +196,6 @@ export function createBlockhashProvider({
     /* Race this caller's own signal against the shared fetch instead of
        passing it into fetchOne — giving up must stop only this call from
        waiting, not cancel the request every other caller is joined on. */
-    if (signal.aborted) throw signal.reason ?? new Error('aborted')
     return new Promise((resolve, reject) => {
       const onAbort = () => reject(signal.reason ?? new Error('aborted'))
       signal.addEventListener('abort', onAbort, { once: true })

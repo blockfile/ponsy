@@ -111,14 +111,36 @@ test('rejects odd-length hex rather than misreading the byte boundary', () => {
   )
 })
 
-test('rejects missing or empty instruction data rather than building a zero-byte instruction', () => {
-  for (const missing of [null, undefined, '']) {
+test('rejects missing instruction data (null or undefined) rather than building a zero-byte instruction', () => {
+  for (const missing of [null, undefined]) {
     const bad = [{ ...INSTRUCTIONS[0], data: missing }]
     assert.throws(
       () => buildSolanaTransaction({ instructions: bad, feePayer: SOL_PAYER, blockhash: SOL_BLOCKHASH }),
       /hex/i,
     )
   }
+})
+
+test('rejects non-string instruction data instead of silently stringifying it into something hex-shaped', () => {
+  /* String(12) is '12' and String(['ab']) is 'ab' — both look like valid hex
+     once stringified, which is exactly how a wrong-typed field used to slip
+     through unnoticed. */
+  for (const notAString of [12, ['ab']]) {
+    const bad = [{ ...INSTRUCTIONS[0], data: notAString }]
+    assert.throws(
+      () => buildSolanaTransaction({ instructions: bad, feePayer: SOL_PAYER, blockhash: SOL_BLOCKHASH }),
+      /hex/i,
+    )
+  }
+})
+
+test('accepts genuinely empty instruction data — some real Solana instructions carry zero bytes', async () => {
+  const { Transaction } = await import('@solana/web3.js')
+  const withEmptyData = [{ ...INSTRUCTIONS[0], data: '' }]
+  const b64 = buildSolanaTransaction({ instructions: withEmptyData, feePayer: SOL_PAYER, blockhash: SOL_BLOCKHASH })
+  const data = Transaction.from(Buffer.from(b64, 'base64')).instructions[0].data
+
+  assert.equal(data.length, 0)
 })
 
 test('rejects a malformed base58 pubkey', () => {
@@ -133,6 +155,21 @@ test('rejects an instruction with no keys rather than building a zero-account in
     () => buildSolanaTransaction({ instructions: bad, feePayer: SOL_PAYER, blockhash: SOL_BLOCKHASH }),
     /keys/i,
   )
+})
+
+test('accepts an empty keys array on one instruction — some real Solana instructions touch no accounts', async () => {
+  const { Transaction } = await import('@solana/web3.js')
+  /* The real fixture instruction still names SOL_PAYER as a signer, so the
+     feePayer cross-check is satisfied by it; the second, synthetic
+     instruction is the one actually under test here — zero accounts. */
+  const noAccountsInstruction = { programId: INSTRUCTIONS[0].programId, keys: [], data: '00' }
+  const b64 = buildSolanaTransaction({
+    instructions: [INSTRUCTIONS[0], noAccountsInstruction], feePayer: SOL_PAYER, blockhash: SOL_BLOCKHASH,
+  })
+  const tx = Transaction.from(Buffer.from(b64, 'base64'))
+
+  assert.equal(tx.instructions.length, 2)
+  assert.equal(tx.instructions[1].keys.length, 0)
 })
 
 test('requires at least one instruction', () => {
@@ -199,4 +236,55 @@ test('surfaces an RPC error rather than returning a stale-looking null', async (
   const fetchImpl = stubFetch([['solana', async () => ({ jsonrpc: '2.0', id: 1, error: { message: 'node behind' } })]])
   const p = createBlockhashProvider({ rpcUrl: 'https://solana.example', fetchImpl })
   await assert.rejects(() => p.get(), /node behind/)
+})
+
+test('an aborting caller rejects only itself; a concurrent caller still resolves from the same fetch', async () => {
+  let calls = 0
+  const fetchImpl = stubFetch([['solana', async () => { calls++; return SOL_BLOCKHASH_REPLY }]])
+  const p = createBlockhashProvider({ rpcUrl: 'https://solana.example', fetchImpl })
+
+  const ac = new AbortController()
+  const aborting = p.get({ signal: ac.signal })
+  const concurrent = p.get()
+  ac.abort(new Error('caller gave up'))
+
+  await assert.rejects(aborting, /caller gave up/)
+  assert.equal((await concurrent).blockhash, SOL_BLOCKHASH)
+  assert.equal(calls, 1, 'the shared fetch runs once regardless of the abort')
+})
+
+test('inFlight clears after an abort, so a later caller starts a fresh fetch', async () => {
+  const c = clock()
+  let calls = 0
+  const fetchImpl = stubFetch([['solana', async () => { calls++; return SOL_BLOCKHASH_REPLY }]])
+  const p = createBlockhashProvider({ rpcUrl: 'https://solana.example', fetchImpl, ttlMs: 10_000, now: c.now })
+
+  const ac = new AbortController()
+  const aborting = p.get({ signal: ac.signal })
+  const concurrent = p.get() // rides the same shared fetch, unaffected by the abort
+  ac.abort()
+
+  await assert.rejects(aborting)
+  await concurrent // the shared fetch has now fully settled and cleared inFlight
+
+  c.advance(10_001)
+  await p.get()
+
+  assert.equal(calls, 2, 'a later call past the TTL starts a fresh fetch rather than being stuck')
+})
+
+test('a pre-aborted signal rejects immediately without starting a fetch', async () => {
+  let calls = 0
+  const fetchImpl = stubFetch([['solana', async () => { calls++; return SOL_BLOCKHASH_REPLY }]])
+  const p = createBlockhashProvider({ rpcUrl: 'https://solana.example', fetchImpl })
+
+  const ac = new AbortController()
+  ac.abort(new Error('already gone'))
+
+  /* This is the crash regression: checking `signal.aborted` after the shared
+     fetch was already created meant a pre-aborted caller discarded it
+     without attaching a handler — an eventual rejection became an unhandled
+     rejection under Node's default --unhandled-rejections=throw. */
+  await assert.rejects(() => p.get({ signal: ac.signal }), /already gone/)
+  assert.equal(calls, 0, 'a caller who already gave up must not trigger an RPC round trip')
 })
