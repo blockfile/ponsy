@@ -15,6 +15,19 @@ const ok = () => stubFetch([
   ['/intents/status', async () => RELAY_STATUS_SUCCESS],
 ])
 
+/**
+ * A blockhash provider that never touches the network.
+ *
+ * Required by every createQuoteService() call below, EVM-included:
+ * construction now fails fast without one (see 'refuses to construct
+ * without a Solana blockhash provider' below), so even a test that never
+ * touches the Solana path needs a well-formed one to build the service at
+ * all.
+ */
+const stubBlockhash = {
+  get: async () => ({ blockhash: SOL_BLOCKHASH, lastValidBlockHeight: 280000000 }),
+}
+
 /** RELAY_QUOTE with steps[0].items[0].data.gas replaced by an arbitrary value. */
 const withGas = (gasValue) => ({
   ...RELAY_QUOTE,
@@ -30,7 +43,7 @@ const withGas = (gasValue) => ({
 })
 
 test('normalises a Relay quote into the shape the widget renders', async () => {
-  const svc = createQuoteService({ config, fetchImpl: ok() })
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
   const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
 
   assert.equal(q.amountIn, 0.02)
@@ -41,7 +54,7 @@ test('normalises a Relay quote into the shape the widget renders', async () => {
 })
 
 test('converts price impact to a fraction, because formatPct multiplies by 100', async () => {
-  const svc = createQuoteService({ config, fetchImpl: ok() })
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
   const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
   /* Relay says "-5.12" meaning -5.12%. The widget's formatPct renders n*100,
      so passing -5.12 through unchanged would display "-512.00%". */
@@ -49,14 +62,14 @@ test('converts price impact to a fraction, because formatPct multiplies by 100',
 })
 
 test('carries minimum received as whole tokens', async () => {
-  const svc = createQuoteService({ config, fetchImpl: ok() })
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
   const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
   assert.ok(Math.abs(q.minReceived - 281338.9641007965) < 0.001)
   assert.ok(q.minReceived < q.amountOut, 'minimum must be below expected')
 })
 
 test('exposes fee, rate, time estimate and route alongside the amounts', async () => {
-  const svc = createQuoteService({ config, fetchImpl: ok() })
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
   const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
 
   // relayer (0.730005) + app (0) — deliberately excludes fees.gas, which the
@@ -69,7 +82,7 @@ test('exposes fee, rate, time estimate and route alongside the amounts', async (
 })
 
 test('exposes the transaction to sign and the requestId to poll', async () => {
-  const svc = createQuoteService({ config, fetchImpl: ok() })
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
   const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
 
   // Full object, including `data` — that's the calldata the wallet actually
@@ -91,7 +104,7 @@ test('forwards gas as a number, never a string or hex, when Relay sends a bare n
   // see the fixture's steps[0].items[0].data.gas (32713, captured live).
   // The frontend's toHexQuantityLoose does the hex-encoding; this layer
   // must pass a genuine number through, untouched in value.
-  const svc = createQuoteService({ config, fetchImpl: ok() })
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
   const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
   assert.equal(q.tx.gas, 32713)
   assert.equal(typeof q.tx.gas, 'number')
@@ -109,6 +122,7 @@ test('forwards gas as a number even when Relay sends it as a numeric string', as
   const svc = createQuoteService({
     config,
     fetchImpl: stubFetch([['/quote', async () => withStringGas]]),
+    blockhash: stubBlockhash,
   })
   const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
   assert.equal(q.tx.gas, 32713)
@@ -132,6 +146,7 @@ test('omits gas entirely, never null, when Relay does not supply it', async () =
   const svc = createQuoteService({
     config,
     fetchImpl: stubFetch([['/quote', async () => noGas]]),
+    blockhash: stubBlockhash,
   })
   const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
   assert.ok(!('gas' in q.tx), 'gas key must be entirely absent, not null/undefined, when Relay omits it')
@@ -146,6 +161,7 @@ test('omits gas for any value that is not a positive whole number', async () => 
     const svc = createQuoteService({
       config,
       fetchImpl: stubFetch([['/quote', async () => withGas(value)]]),
+      blockhash: stubBlockhash,
     })
     const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
     assert.ok(!('gas' in q.tx), label)
@@ -169,6 +185,7 @@ test('rejects a Relay response with no sending account for the transaction', asy
   const svc = createQuoteService({
     config,
     fetchImpl: stubFetch([['/quote', async () => noFrom]]),
+    blockhash: stubBlockhash,
   })
   await assert.rejects(
     () => svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' }),
@@ -178,7 +195,7 @@ test('rejects a Relay response with no sending account for the transaction', asy
 
 test('sends the hardcoded PONSY address, never one from the caller', async () => {
   const fetchImpl = ok()
-  const svc = createQuoteService({ config, fetchImpl })
+  const svc = createQuoteService({ config, fetchImpl, blockhash: stubBlockhash })
   await svc.getQuote({
     user: USER, chainId: 8453, amount: '0.02',
     destinationCurrency: '0xd314ee5350570e57c8e2e5bb6b3920cd1a16083e', // impostor
@@ -189,7 +206,7 @@ test('sends the hardcoded PONSY address, never one from the caller', async () =>
 })
 
 test('rejects a chain that is not allowlisted', async () => {
-  const svc = createQuoteService({ config, fetchImpl: ok() })
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
   await assert.rejects(
     () => svc.getQuote({ user: USER, chainId: 137, amount: '0.02' }),
     /chain 137 is not supported/,
@@ -203,7 +220,7 @@ test('accepts chain 56 (BNB Chain) as an allowed source', async () => {
   // a regression that silently drops or overwrites the caller's chain id
   // still fails here even though the response body wouldn't show it.
   const fetchImpl = ok()
-  const svc = createQuoteService({ config, fetchImpl })
+  const svc = createQuoteService({ config, fetchImpl, blockhash: stubBlockhash })
   const q = await svc.getQuote({ user: USER, chainId: 56, amount: '0.02' })
   assert.equal(q.mock, false)
   const body = JSON.parse(fetchImpl.calls[0].init.body)
@@ -214,7 +231,7 @@ test('accepts chain 56 (BNB Chain) as an allowed source', async () => {
 })
 
 test('rejects a malformed user address', async () => {
-  const svc = createQuoteService({ config, fetchImpl: ok() })
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
   await assert.rejects(
     () => svc.getQuote({ user: 'nope', chainId: 8453, amount: '0.02' }),
     /user must be/,
@@ -222,7 +239,7 @@ test('rejects a malformed user address', async () => {
 })
 
 test('rejects a non-positive amount', async () => {
-  const svc = createQuoteService({ config, fetchImpl: ok() })
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
   await assert.rejects(
     () => svc.getQuote({ user: USER, chainId: 8453, amount: '0' }),
     /amount must be a positive number/,
@@ -240,6 +257,7 @@ test('rejects a trade below the USD minimum, naming the minimum', async () => {
   const svc = createQuoteService({
     config,
     fetchImpl: stubFetch([['/quote', async () => tiny]]),
+    blockhash: stubBlockhash,
   })
   await assert.rejects(
     () => svc.getQuote({ user: USER, chainId: 8453, amount: '0.0026' }),
@@ -260,6 +278,7 @@ test('rejects an unverifiable trade value, distinctly from the minimum message',
     const svc = createQuoteService({
       config,
       fetchImpl: stubFetch([['/quote', async () => bad]]),
+      blockhash: stubBlockhash,
     })
     await assert.rejects(
       () => svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' }),
@@ -270,7 +289,7 @@ test('rejects an unverifiable trade value, distinctly from the minimum message',
 })
 
 test('refuses to run when TOKEN_ADDRESS is unset', async () => {
-  const svc = createQuoteService({ config: buildConfig({}), fetchImpl: ok() })
+  const svc = createQuoteService({ config: buildConfig({}), fetchImpl: ok(), blockhash: stubBlockhash })
   await assert.rejects(
     () => svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' }),
     /TOKEN_ADDRESS is not set/,
@@ -278,9 +297,28 @@ test('refuses to run when TOKEN_ADDRESS is unset', async () => {
 })
 
 test('passes status through', async () => {
-  const svc = createQuoteService({ config, fetchImpl: ok() })
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
   const s = await svc.getStatus('0xabc')
   assert.equal(s.status, 'success')
+})
+
+test('refuses to construct without a Solana blockhash provider — fail at boot, not mid-request', () => {
+  // Before this guard, an omitted provider surfaced only when a Solana
+  // request actually hit blockhash.get() — deep inside a request handler,
+  // after a live Relay round trip, as a raw "Cannot read properties of
+  // undefined (reading 'get')" TypeError turned into an opaque HTTP 400.
+  // index.js constructs this service exactly once, at startup, so a wiring
+  // bug here belongs at that one call site, not at the first unlucky
+  // request.
+  assert.throws(
+    () => createQuoteService({ config, fetchImpl: ok() }),
+    /blockhash/i,
+  )
+  assert.throws(
+    () => createQuoteService({ config, fetchImpl: ok(), blockhash: {} }),
+    /blockhash/i,
+    'an object with no get() method must be rejected the same as a missing one',
+  )
 })
 
 test('toWei converts a decimal ETH string to integer wei', () => {
@@ -305,11 +343,6 @@ test('toWei rejects malformed input with its own message, distinct from non-posi
 })
 
 const SOLANA_CHAIN = 792703809
-
-/** A blockhash provider that never touches the network. */
-const stubBlockhash = {
-  get: async () => ({ blockhash: SOL_BLOCKHASH, lastValidBlockHeight: 280000000 }),
-}
 
 /**
  * Same token as the shared `config` above, but with the $25 USD minimum
@@ -364,6 +397,10 @@ test('sends SOL as the origin currency and the EVM address as the recipient', as
   assert.equal(body.user, SOL_PAYER)
   assert.equal(body.recipient, EVM_RECIPIENT, 'the EVM wallet receives, not the payer')
   assert.equal(body.destinationCurrency, PONSY_ADDRESS.toLowerCase())
+  // Mutating quote.js's amount line to toWei(amount) (18 decimals) instead
+  // of toLamports(amount) (9) leaves every other assertion in this file
+  // untouched — this is the one line that decides how much money moves.
+  assert.equal(body.amount, '250000000', 'SOL has 9 decimals — wei scaling here is a 10^9 error')
 })
 
 test('rejects a Solana origin with no recipient — never guess a destination', async () => {
@@ -373,12 +410,31 @@ test('rejects a Solana origin with no recipient — never guess a destination', 
   )
 })
 
+test('rejects the zero address as a Solana recipient — unrecoverable, not just unusual', async () => {
+  // Unreachable on EVM (the recipient there is always the connected
+  // wallet), but a Solana recipient is free-form: a frontend bug or a
+  // crafted link could otherwise produce a signable transaction that
+  // delivers PONSY to the burn address, and it would round-trip as an
+  // ordinary-looking HTTP 200 today.
+  await assert.rejects(
+    () => solanaService().getQuote({
+      user: SOL_PAYER, chainId: SOLANA_CHAIN, amount: '0.25',
+      recipient: '0x0000000000000000000000000000000000000000',
+    }),
+    /zero address/i,
+  )
+})
+
 test('rejects an EVM address as the payer on a Solana origin', async () => {
   await assert.rejects(
     () => solanaService().getQuote({
       user: EVM_RECIPIENT, chainId: SOLANA_CHAIN, amount: '0.25', recipient: EVM_RECIPIENT,
     }),
-    /base58|Solana/i,
+    // Deliberately the exact message, not the looser /base58|Solana/i this
+    // started as: that pattern also matches @solana/web3.js's own incidental
+    // "Non-base58 character" error, so it kept passing even with the
+    // BASE58_RE guard in quote.js deleted entirely.
+    /user must be a base58 Solana address/,
   )
 })
 
@@ -389,13 +445,52 @@ test('rejects a base58 payer on an EVM origin', async () => {
   )
 })
 
-test('EVM quotes still default the recipient to the payer', async () => {
+test('an EVM origin ignores a supplied recipient — the payer always receives', async () => {
+  // Not just "defaults when absent": recipient became reachable from the
+  // query string in 58f48cc (src/server.js's /quote route), so a mutation
+  // that let a caller override the EVM receiver — e.g. `receiver = recipient
+  // ?? user`, or `isSolana = origin === SOLANA_CHAIN_ID || !!recipient` —
+  // would let ?chainId=8453&user=0xVictim&recipient=0xAttacker redirect the
+  // swap output while the victim's wallet shows only an ordinary deposit to
+  // Relay. A test that never supplies a recipient cannot distinguish
+  // "defaults to the payer" from "ignores whatever it's given" — this one
+  // supplies an adversarial one and asserts it never reaches the request.
   const fetchImpl = ok()
   await createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
     user: USER, chainId: 8453, amount: '0.02',
+    recipient: '0xdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
   })
   const body = JSON.parse(fetchImpl.calls[0].init.body)
-  assert.equal(body.recipient, USER, 'unchanged EVM behaviour')
+  assert.equal(body.recipient, USER, 'the payer receives — a caller-supplied recipient must be ignored on EVM')
+  assert.equal(body.amount, '20000000000000000')
+})
+
+test('coerces array-wrapped query params (?user[0]=...) to plain strings before forwarding', async () => {
+  // Express turns ?user[0]=<value> into a one-element array. String() of a
+  // one-element array equals its bare element, so the BASE58_RE/ADDRESS_RE
+  // checks in quote.js are fooled into passing — this test is not about
+  // validation, which already tolerates this input, but about what
+  // happens to it AFTER validation. Before forwarding was fixed to
+  // re-stringify, the raw array reached both the Relay request body and
+  // buildSolanaTransaction's feePayer unchanged: new PublicKey([SOL_PAYER])
+  // does not throw, it silently yields the all-zeros system-program key
+  // (confirmed directly against @solana/web3.js). That this fixture's
+  // instructions happen not to declare that bogus key a signer is the only
+  // reason the old code threw instead of silently signing with the wrong
+  // fee payer — incidental protection, not a guarantee.
+  const fetchImpl = stubFetch([['/quote', async () => RELAY_SOLANA_QUOTE]])
+  const q = await createQuoteService({
+    config: solanaTestConfig(), fetchImpl, blockhash: stubBlockhash,
+  }).getQuote({
+    user: [SOL_PAYER], chainId: SOLANA_CHAIN, amount: '0.25', recipient: [EVM_RECIPIENT],
+  })
+
+  const body = JSON.parse(fetchImpl.calls[0].init.body)
+  assert.equal(body.user, SOL_PAYER)
+  assert.equal(typeof body.user, 'string')
+  assert.equal(body.recipient, EVM_RECIPIENT)
+  assert.equal(typeof body.recipient, 'string')
+  assert.ok(q.solanaTx, 'feePayer must resolve to the real payer, not a bogus PublicKey built from an array')
 })
 
 test('still emits marketCap-style shared fields for a Solana quote', async () => {

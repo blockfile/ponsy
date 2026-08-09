@@ -88,6 +88,17 @@ function parseGasLimit(value) {
 }
 
 export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
+  /* A missing or malformed blockhash provider must fail here, at
+     construction — index.js calls this once, at boot — not three levels
+     deep inside a live request handler after a Relay round trip has already
+     happened. Before this check, an omitted provider surfaced as a bare
+     `Cannot read properties of undefined (reading 'get')` TypeError, caught
+     by server.js's generic catch-all and reported to the caller as an
+     opaque HTTP 400 — a wiring bug dressed up as a user-facing error. */
+  if (!blockhash?.get) {
+    throw new Error('createQuoteService requires a blockhash provider with a get() method')
+  }
+
   async function getQuote({ user, chainId, amount, recipient, signal }) {
     if (!config.tokenAddress) {
       throw new Error('TOKEN_ADDRESS is not set')
@@ -109,17 +120,40 @@ export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
       if (!ADDRESS_RE.test(String(recipient ?? ''))) {
         throw new Error('recipient must be a 0x address when paying from Solana')
       }
+      /* The zero address is a syntactically valid 0x string, so the check
+         above alone lets it through. On EVM this was never reachable — the
+         recipient there is always the connected wallet — but a Solana
+         recipient is a free-form field, so a frontend bug or a crafted link
+         can produce a signable transaction that delivers PONSY to a burn
+         address. Reuses NATIVE (the same literal zero address) rather than
+         a second constant for the same 42-character string. */
+      if (String(recipient).toLowerCase() === NATIVE) {
+        throw new Error('recipient must not be the zero address — that PONSY would be unrecoverable')
+      }
     } else if (!ADDRESS_RE.test(String(user ?? ''))) {
       throw new Error('user must be a 0x-prefixed 40-hex-character address')
     }
 
+    /* Re-stringified rather than forwarded as-is: Express turns
+       `?user[0]=...` into a one-element array, and String() of a
+       one-element array equals its bare element — so the ADDRESS_RE/
+       BASE58_RE checks above can pass while `user`/`recipient` are still
+       arrays, not strings. Letting that array reach the Relay request body,
+       or buildSolanaTransaction's feePayer below, is the actual hazard:
+       `new PublicKey(['abc...'])` does not throw, it silently yields the
+       all-zeros system-program key (verified directly against
+       @solana/web3.js) — caught in this codebase's own tests only by
+       incidental luck, because that bogus key happens not to be declared a
+       signer in the captured fixture's instructions. A plain string is the
+       one thing every downstream consumer must receive. */
+    const payer = String(user)
     /* On EVM the payer receives, exactly as before. */
-    const receiver = isSolana ? recipient : user
+    const receiver = isSolana ? String(recipient) : payer
 
     const raw = await fetchRelayQuote(
       config.relayUrl,
       {
-        user,
+        user: payer,
         recipient: receiver,
         originChainId: origin,
         destinationChainId: 4663,
@@ -176,7 +210,7 @@ export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
         solanaTx: {
           base64: buildSolanaTransaction({
             instructions: ixs,
-            feePayer: user,
+            feePayer: payer,
             blockhash: hash,
           }),
           lastValidBlockHeight,
