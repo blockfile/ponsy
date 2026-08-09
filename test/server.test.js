@@ -336,6 +336,38 @@ test('GET /quote forwards recipient from the query string verbatim', async () =>
   )
 })
 
+test('GET /quote forwards token from the query string verbatim', async () => {
+  // Mirrors the recipient test above — the same class of bug (58f48cc:
+  // recipient dropped at the HTTP layer while every unit test calling
+  // getQuote() directly stayed green, because none of them go through
+  // server.js's route). Deleting or renaming server.js's `token:
+  // req.query.token` would make ?token=usdc unreachable, silently falling
+  // back to a native quote at a completely different amount, and no test
+  // that calls getQuote() directly can see that regression.
+  let received
+  await withServer(
+    {
+      config: CONFIG,
+      collect: async () => PAYLOAD,
+      quoteService: quoteStub({
+        getQuote: async (args) => {
+          received = args
+          return QUOTE
+        },
+      }),
+      cacheTtlMs: 0,
+      staleMaxMs: 0,
+    },
+    async (get) => {
+      const res = await get(
+        '/quote?amount=40&chainId=8453&user=0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E&token=usdc',
+      )
+      assert.equal(res.status, 200)
+      assert.equal(received.token, 'usdc')
+    },
+  )
+})
+
 test('GET /quote forwards a missing recipient as undefined, not "" or null', async () => {
   // getQuote's own recipient-defaulting (EVM: falls back to user) and
   // Solana validation (ADDRESS_RE.test(String(recipient ?? ''))) both depend

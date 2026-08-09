@@ -204,6 +204,11 @@ export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
        neither: a frontend that hasn't been updated for the other VM must fail
        loudly on an undefined field rather than sign something meaningless. */
     let txField
+    /* How many signatures this quote actually requires, hoisted out of the
+       branch below so the shared `route` string can reflect it. A Solana
+       quote is always exactly one blob to sign; an EVM quote may be one
+       (deposit) or two (approve, deposit). */
+    let stepCount
     if (isSolana) {
       const ixs = item?.data?.instructions
       if (!Array.isArray(ixs) || ixs.length === 0) {
@@ -220,6 +225,7 @@ export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
           lastValidBlockHeight,
         },
       }
+      stepCount = 1
     } else {
       const rawSteps = raw?.steps ?? []
       if (rawSteps.length === 0) throw new Error('Relay returned no steps to sign')
@@ -269,6 +275,7 @@ export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
          such a client must fail loudly rather than sign the approval and stop,
          leaving the user having paid gas for nothing. */
       txField = steps.length === 1 ? { steps, tx: steps[0].tx } : { steps }
+      stepCount = steps.length
     }
 
     return {
@@ -293,10 +300,22 @@ export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
          displays separately. Adding it here would double-count it. */
       feeUsd: num(raw?.fees?.relayer?.amountUsd) + num(raw?.fees?.app?.amountUsd),
       timeEstimate: num(d.timeEstimate),
-      route: `${originName(origin)} to Robinhood Chain, one transaction`,
+      /* Reflects the real signature count. A hardcoded "one transaction" here
+         lied on a two-step (approve + deposit) quote — exactly the live USDC
+         capture in this task's report — telling the user to expect one
+         signature on the path that requires two. */
+      route: `${originName(origin)} to Robinhood Chain, ${
+        stepCount === 1 ? 'one transaction' : `${stepCount} transactions`
+      }`,
       // Which origin asset this quote priced, so the UI can label the amount
       // without re-deriving it from the request it already sent.
       token: { key: originToken.key, symbol: originToken.symbol, decimals: originToken.decimals },
+      /* A field that is always present and always meaningful, so an executor
+         (Task 4) can branch on it directly instead of inferring the VM from
+         which of tx/steps/solanaTx happens to be present — the defensive
+         `quote.steps ?? []` idiom silently iterates zero steps and reports
+         success on a Solana quote, having signed nothing. */
+      vm: isSolana ? 'svm' : 'evm',
       ...txField,
       requestId: raw?.steps?.[0]?.requestId ?? null,
       mock: false,

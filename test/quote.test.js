@@ -376,6 +376,7 @@ test('accepts a base58 payer for a Solana origin', async () => {
   })
   assert.ok(q.solanaTx, 'a Solana quote must carry solanaTx')
   assert.equal(q.tx, undefined, 'and must NOT carry an EVM tx')
+  assert.equal(q.vm, 'svm', 'a positive discriminator, not inferred from which tx field is absent')
 })
 
 test('returns a base64 transaction and the blockhash expiry', async () => {
@@ -602,6 +603,80 @@ test('returns every step for a two-step quote, in order', async () => {
   assert.deepEqual(q.steps.map((s) => s.id), ['approve', 'deposit'])
   assert.equal(q.steps[0].tx.to, '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913')
   assert.equal(q.steps[1].tx.to, '0x4cd00e387622c35bddb9b4c962c136462338bc31')
+  // The other half of the single-step ternary (`{ steps, tx: ... }` vs
+  // `{ steps }`) — a client that predates the steps array must fail loudly
+  // on a two-step quote rather than sign the approval and stop.
+  assert.ok(!('tx' in q), 'tx must be entirely absent on a multi-step quote, not undefined')
+  // A hardcoded "one transaction" here would tell the user to expect one
+  // signature on the exact path that requires two.
+  assert.equal(q.route, 'Base to Robinhood Chain, 2 transactions')
+})
+
+test('validates every step, not just the first — a missing `to` on a later step fails on that step', async () => {
+  // The only prior guard test used the single-step fixture, so it could not
+  // tell "every step" from "the first step". This deletes `to` from the
+  // SECOND step of a two-step fixture — restricting the check to steps[0],
+  // or deleting it outright, stays green without this.
+  const { to, ...dataWithoutTo } = RELAY_APPROVE_QUOTE.steps[1].items[0].data
+  const badDeposit = {
+    ...RELAY_APPROVE_QUOTE,
+    steps: [
+      RELAY_APPROVE_QUOTE.steps[0],
+      { ...RELAY_APPROVE_QUOTE.steps[1], items: [{ ...RELAY_APPROVE_QUOTE.steps[1].items[0], data: dataWithoutTo }] },
+    ],
+  }
+  const svc = createQuoteService({
+    config,
+    fetchImpl: stubFetch([['/quote', async () => badDeposit]]),
+    blockhash: stubBlockhash,
+  })
+  await assert.rejects(
+    () => svc.getQuote({ user: USER, chainId: 8453, amount: '40', token: 'usdc' }),
+    /Relay step "deposit" has no transaction to sign/,
+  )
+})
+
+test('validates every step, not just the first — a missing `from` on a later step fails on that step', async () => {
+  const { from, ...dataWithoutFrom } = RELAY_APPROVE_QUOTE.steps[1].items[0].data
+  const badDeposit = {
+    ...RELAY_APPROVE_QUOTE,
+    steps: [
+      RELAY_APPROVE_QUOTE.steps[0],
+      { ...RELAY_APPROVE_QUOTE.steps[1], items: [{ ...RELAY_APPROVE_QUOTE.steps[1].items[0], data: dataWithoutFrom }] },
+    ],
+  }
+  const svc = createQuoteService({
+    config,
+    fetchImpl: stubFetch([['/quote', async () => badDeposit]]),
+    blockhash: stubBlockhash,
+  })
+  await assert.rejects(
+    () => svc.getQuote({ user: USER, chainId: 8453, amount: '40', token: 'usdc' }),
+    /Relay step "deposit" has no sending account/,
+  )
+})
+
+test('the $25 minimum is not bypassed for a named token', async () => {
+  // Same shape as 'the $25 minimum is not bypassed for a Solana origin' —
+  // `token` is a new input to the one control this layer exists to enforce,
+  // and gating the minimum on originToken.key === 'native' would stay green
+  // everywhere else while quietly skipping the check for every named token.
+  const tiny = {
+    ...RELAY_APPROVE_QUOTE,
+    details: {
+      ...RELAY_APPROVE_QUOTE.details,
+      currencyIn: { ...RELAY_APPROVE_QUOTE.details.currencyIn, amountUsd: '5.00' },
+    },
+  }
+  const svc = createQuoteService({
+    config,
+    fetchImpl: stubFetch([['/quote', async () => tiny]]),
+    blockhash: stubBlockhash,
+  })
+  await assert.rejects(
+    () => svc.getQuote({ user: USER, chainId: 8453, amount: '40', token: 'usdc' }),
+    /minimum trade is \$25/,
+  )
 })
 
 test('a single-step quote still carries tx, so existing clients keep working', async () => {
@@ -619,4 +694,14 @@ test('reports the resolved token so the UI can label the amount', async () => {
   const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '40', token: 'usdc' })
   assert.equal(q.token.symbol, 'USDC')
   assert.equal(q.token.decimals, 6)
+})
+
+test('reports vm: "evm" for an EVM origin — a field an executor can always branch on', async () => {
+  // The defensive `quote.steps ?? []` idiom silently iterates zero steps and
+  // reports success on a Solana quote, having signed nothing. `vm` gives
+  // Task 4 a field that is always present and always meaningful, instead of
+  // inferring the VM from which of tx/steps/solanaTx happens to be missing.
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
+  const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
+  assert.equal(q.vm, 'evm')
 })
