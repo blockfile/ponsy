@@ -6,6 +6,7 @@ import { createQuoteService, toWei, toLamports } from '../src/quote.js'
 import {
   RELAY_QUOTE, RELAY_STATUS_SUCCESS, PONSY_ADDRESS, stubFetch,
   RELAY_SOLANA_QUOTE, SOL_PAYER, EVM_RECIPIENT, SOL_BLOCKHASH,
+  RELAY_APPROVE_QUOTE,
 } from './fixtures.js'
 
 const USER = '0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E'
@@ -529,4 +530,93 @@ test('toLamports converts a decimal SOL string to integer lamports, at 9 decimal
   // 0.25 SOL is exactly the 250000000 lamports the live fixture captures.
   assert.equal(toLamports('0.25'), '250000000')
   assert.equal(toLamports('1'), '1000000000')
+})
+
+test('defaults to the native asset when no token is named', async () => {
+  const fetchImpl = ok()
+  await createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
+    user: USER, chainId: 8453, amount: '0.02',
+  })
+  const body = JSON.parse(fetchImpl.calls[0].init.body)
+  assert.equal(body.originCurrency, '0x0000000000000000000000000000000000000000')
+})
+
+test('sends the allowlisted address for a named token', async () => {
+  const fetchImpl = ok()
+  await createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
+    user: USER, chainId: 8453, amount: '40', token: 'usdc',
+  })
+  const body = JSON.parse(fetchImpl.calls[0].init.body)
+  assert.equal(body.originCurrency, '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913')
+})
+
+test('scales by the token decimals, not by 18', async () => {
+  /* USDC is 6 decimals. Scaling 40 by 18 would send 4e19 instead of 4e7 —
+     a 10^12 error. */
+  const fetchImpl = ok()
+  await createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
+    user: USER, chainId: 8453, amount: '40', token: 'usdc',
+  })
+  assert.equal(JSON.parse(fetchImpl.calls[0].init.body).amount, '40000000')
+})
+
+test('uses 18 decimals for USDC on BNB Chain, where it is a BEP-20 re-issue', async () => {
+  const fetchImpl = ok()
+  await createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
+    user: USER, chainId: 56, amount: '40', token: 'usdc',
+  })
+  assert.equal(JSON.parse(fetchImpl.calls[0].init.body).amount, '40000000000000000000')
+})
+
+test('refuses a token address supplied by the caller', async () => {
+  await assert.rejects(
+    () => createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash }).getQuote({
+      user: USER, chainId: 8453, amount: '40',
+      token: '0xd314ee5350570e57c8e2e5bb6b3920cd1a16083e',
+    }),
+    /not available/,
+  )
+})
+
+test('refuses an SPL token on Solana before calling Relay', async () => {
+  const fetchImpl = ok()
+  await assert.rejects(
+    () => createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
+      user: SOL_PAYER, chainId: 792703809, amount: '1',
+      recipient: EVM_RECIPIENT, token: 'usdc',
+    }),
+    /not available/,
+  )
+  assert.equal(fetchImpl.calls.length, 0, 'must not reach Relay')
+})
+
+test('returns every step for a two-step quote, in order', async () => {
+  const svc = createQuoteService({
+    config,
+    fetchImpl: stubFetch([['/quote', async () => RELAY_APPROVE_QUOTE]]),
+    blockhash: stubBlockhash,
+  })
+  const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '40', token: 'usdc' })
+
+  assert.equal(q.steps.length, 2)
+  assert.deepEqual(q.steps.map((s) => s.id), ['approve', 'deposit'])
+  assert.equal(q.steps[0].tx.to, '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913')
+  assert.equal(q.steps[1].tx.to, '0x4cd00e387622c35bddb9b4c962c136462338bc31')
+})
+
+test('a single-step quote still carries tx, so existing clients keep working', async () => {
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
+  const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
+
+  assert.equal(q.steps.length, 1)
+  assert.equal(q.steps[0].id, 'deposit')
+  assert.ok(q.tx, 'tx must remain for single-step quotes')
+  assert.equal(q.tx.to, q.steps[0].tx.to)
+})
+
+test('reports the resolved token so the UI can label the amount', async () => {
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
+  const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '40', token: 'usdc' })
+  assert.equal(q.token.symbol, 'USDC')
+  assert.equal(q.token.decimals, 6)
 })

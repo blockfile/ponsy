@@ -270,3 +270,61 @@ export const SOL_BLOCKHASH_REPLY = {
     value: { blockhash: SOL_BLOCKHASH, lastValidBlockHeight: 280000000 },
   },
 }
+
+/**
+ * POST /quote — 40 USDC on Base -> PONSY. Captured 2026-08-09.
+ *
+ * Note both steps are `kind: "transaction"`: the approval is an on-chain
+ * transaction, not a signature, and it approves the exact trade amount
+ * (40000000) rather than uint256 max.
+ */
+export const RELAY_APPROVE_QUOTE = {
+  steps: [
+    {
+      id: 'approve',
+      kind: 'transaction',
+      requestId: '0xaa11bb22cc33dd44ee55ff6677889900aabbccddeeff00112233445566778899',
+      items: [{
+        status: 'incomplete',
+        data: {
+          from: '0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E',
+          to: '0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913',
+          data: '0x095ea7b30000000000000000000000004cd00e387622c35bddb9b4c962c136462338bc310000000000000000000000000000000000000000000000000000000002625a00',
+          value: '0', chainId: 8453, gas: 60000,
+        },
+        check: { endpoint: '/intents/status?requestId=0xaa11bb22', method: 'GET' },
+      }],
+    },
+    {
+      id: 'deposit',
+      kind: 'transaction',
+      requestId: '0xaa11bb22cc33dd44ee55ff6677889900aabbccddeeff00112233445566778899',
+      items: [{
+        status: 'incomplete',
+        data: {
+          from: '0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E',
+          to: '0x4cd00e387622c35bddb9b4c962c136462338bc31',
+          data: '0xe80179520000000000000000000000002dfec17b1d8dce43cb5b1111352fd58be01d389e',
+          value: '0', chainId: 8453, gas: 180000,
+        },
+        check: { endpoint: '/intents/status?requestId=0xaa11bb22', method: 'GET' },
+      }],
+    },
+  ],
+  fees: { gas: { amountUsd: '0.02' }, relayer: { amountUsd: '0.35' }, app: { amountUsd: '0' } },
+  details: {
+    operation: 'swap',
+    currencyIn: {
+      currency: { chainId: 8453, symbol: 'USDC', decimals: 6 },
+      amount: '40000000', amountFormatted: '40', amountUsd: '39.99',
+    },
+    currencyOut: {
+      currency: { chainId: 4663, address: '0x2e84f2e0b88bd3ffb5d6738ae0e3c7c00137083e', symbol: 'PONSY', decimals: 18 },
+      amount: '300000000000000000000000', amountFormatted: '300000', amountUsd: '34.61',
+      minimumAmount: '294000000000000000000000',
+    },
+    totalImpact: { usd: '-5.38', percent: '-13.45' },
+    swapImpact: { usd: '-5.00', percent: '-12.50' },
+    timeEstimate: 4,
+  },
+}

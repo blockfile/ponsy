@@ -164,6 +164,7 @@ export function createServer({ config, statsService, quoteService, cache, logger
         chainId: req.query.chainId,
         amount: req.query.amount,
         recipient: req.query.recipient,
+        token: req.query.token,
       })
       res.json(quote)
     } catch (err) {
