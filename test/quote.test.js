@@ -12,6 +12,20 @@ const ok = () => stubFetch([
   ['/intents/status', async () => RELAY_STATUS_SUCCESS],
 ])
 
+/** RELAY_QUOTE with steps[0].items[0].data.gas replaced by an arbitrary value. */
+const withGas = (gasValue) => ({
+  ...RELAY_QUOTE,
+  steps: [
+    {
+      ...RELAY_QUOTE.steps[0],
+      items: [{
+        ...RELAY_QUOTE.steps[0].items[0],
+        data: { ...RELAY_QUOTE.steps[0].items[0].data, gas: gasValue },
+      }],
+    },
+  ],
+})
+
 test('normalises a Relay quote into the shape the widget renders', async () => {
   const svc = createQuoteService({ config, fetchImpl: ok() })
   const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
@@ -63,8 +77,76 @@ test('exposes the transaction to sign and the requestId to poll', async () => {
     data: '0x49290c1c0000000000000000000000002dfec17b1d8dce43cb5b1111352fd58be01d389e',
     value: '20000000000000000',
     chainId: 8453,
+    gas: 32713,
   })
   assert.match(q.requestId, /^0x/)
+})
+
+test('forwards gas as a number, never a string or hex, when Relay sends a bare number', async () => {
+  // This is the field a dropped copy of which sent a real MetaMask-on-Base
+  // user to a 140,000,000-gas fallback estimate and an Infura rejection —
+  // see the fixture's steps[0].items[0].data.gas (32713, captured live).
+  // The frontend's toHexQuantityLoose does the hex-encoding; this layer
+  // must pass a genuine number through, untouched in value.
+  const svc = createQuoteService({ config, fetchImpl: ok() })
+  const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
+  assert.equal(q.tx.gas, 32713)
+  assert.equal(typeof q.tx.gas, 'number')
+})
+
+test('forwards gas as a number even when Relay sends it as a numeric string', async () => {
+  // Live evidence, not a hypothetical: two independent POSTs to the real
+  // https://api.relay.link/quote (2026-08-09, different amounts/requestIds)
+  // both returned "gas":"32713" — a JSON string — even though the fixture
+  // above (and the original bug report) assumed a bare number. A strict
+  // `typeof === 'number'` check silently drops gas on every real quote
+  // while still passing against the fixture. Pin the coercion so this
+  // regresses loudly if "simplified" back to a strict typeof check.
+  const withStringGas = withGas('32713')
+  const svc = createQuoteService({
+    config,
+    fetchImpl: stubFetch([['/quote', async () => withStringGas]]),
+  })
+  const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
+  assert.equal(q.tx.gas, 32713)
+  assert.equal(typeof q.tx.gas, 'number')
+})
+
+test('omits gas entirely, never null, when Relay does not supply it', async () => {
+  // A missing key lets the wallet fall back to its own estimation — correct
+  // on chains where estimation works. A null or 0 limit would be strictly
+  // worse everywhere, so absence must stay absence, not become a null field.
+  const { gas, ...dataWithoutGas } = RELAY_QUOTE.steps[0].items[0].data
+  const noGas = {
+    ...RELAY_QUOTE,
+    steps: [
+      {
+        ...RELAY_QUOTE.steps[0],
+        items: [{ ...RELAY_QUOTE.steps[0].items[0], data: dataWithoutGas }],
+      },
+    ],
+  }
+  const svc = createQuoteService({
+    config,
+    fetchImpl: stubFetch([['/quote', async () => noGas]]),
+  })
+  const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
+  assert.ok(!('gas' in q.tx), 'gas key must be entirely absent, not null/undefined, when Relay omits it')
+})
+
+test('omits gas for any value that is not a positive whole number', async () => {
+  // A zero or garbled limit is strictly worse than none — it must fall back
+  // to omission (wallet estimates) exactly like a genuinely missing field,
+  // not be forwarded as a bogus limit.
+  const cases = { zero: 0, 'zero string': '0', negative: -5, 'non-numeric': 'abc', fractional: '32713.5' }
+  for (const [label, value] of Object.entries(cases)) {
+    const svc = createQuoteService({
+      config,
+      fetchImpl: stubFetch([['/quote', async () => withGas(value)]]),
+    })
+    const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
+    assert.ok(!('gas' in q.tx), label)
+  }
 })
 
 test('rejects a Relay response with no sending account for the transaction', async () => {

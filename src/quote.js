@@ -46,6 +46,26 @@ const num = (v) => {
   return Number.isFinite(n) ? n : 0
 }
 
+/**
+ * Parses Relay's gas LIMIT into a definite JS number, or undefined if
+ * absent/unusable — never 0, never a string.
+ *
+ * Runs through Number() rather than a `typeof === 'number'` check: a live
+ * capture against api.relay.link (2026-08-09, two independent requests,
+ * different amounts) showed this field arriving as `"32713"` — a JSON
+ * *string* — not the bare number the field conceptually is. A strict
+ * typeof check would silently drop gas on every real quote while still
+ * passing a fixture-based test that (reasonably, but incorrectly per this
+ * live evidence) encodes it as a number. Number() normalises either wire
+ * shape to the same value, so the forwarded field is always a genuine
+ * number by the time it reaches the frontend's toHexQuantityLoose.
+ */
+function parseGasLimit(value) {
+  if (value === undefined || value === null) return undefined
+  const n = Number(value)
+  return Number.isInteger(n) && n > 0 ? n : undefined
+}
+
 export function createQuoteService({ config, fetchImpl = fetch }) {
   async function getQuote({ user, chainId, amount }) {
     if (!config.tokenAddress) {
@@ -101,6 +121,7 @@ export function createQuoteService({ config, fetchImpl = fetch }) {
     const amountOut = num(d.currencyOut?.amountFormatted)
     const amountIn = num(d.currencyIn?.amountFormatted)
     const item = raw?.steps?.[0]?.items?.[0]
+    const gasLimit = parseGasLimit(item?.data?.gas)
 
     if (!item?.data?.to) {
       throw new Error('Relay returned no transaction to sign')
@@ -146,6 +167,34 @@ export function createQuoteService({ config, fetchImpl = fetch }) {
         data: item.data.data,
         value: String(item.data.value ?? '0'),
         chainId: item.data.chainId,
+        /* Gas LIMIT, forwarded as a genuine JS number (see parseGasLimit) —
+           never stringified, never hex-encoded. The frontend's buildTxParams
+           already hex-encodes it via toHexQuantityLoose before it reaches the
+           wallet. Dropping this field is exactly what sent a real Base user's
+           MetaMask into eth_estimateGas failure, a fallback to the block gas
+           limit (140,000,000), and an Infura per-tx cap rejection — the real
+           requirement was 32,713, about 4,280x smaller. Omitted entirely
+           (never null/0/undefined as a key) when Relay doesn't supply a
+           usable one, so the wallet falls back to its own estimation —
+           correct behaviour on chains where estimation actually works, and
+           merely the status quo on Base. A present-but-zero limit would be
+           strictly worse than omission everywhere, so it is not treated as
+           "supplied" either.
+
+           Deliberately does NOT include maxFeePerGas / maxPriorityFeePerGas.
+           Those are *prices*, not limits, and Relay's numbers are a snapshot
+           taken at quote time — by the time the wallet signs and sends, the
+           network's fee market has moved. Pinning a stale, possibly too-low
+           maxFeePerGas produces a transaction that just sits unmined; a
+           wallet's own fee estimator reads current conditions and will
+           always do this better than a several-second-old quote. The gas
+           *limit* has no such staleness problem: it's a property of the call
+           itself (what this exact calldata costs to execute), which is why
+           Relay can compute it up front and the wallet cannot without first
+           trying and failing. Do not "complete the set" by adding the fee
+           fields here — that would trade one class of broken transaction for
+           another. */
+        ...(gasLimit !== undefined ? { gas: gasLimit } : {}),
       },
       requestId: raw?.steps?.[0]?.requestId ?? null,
       mock: false,
