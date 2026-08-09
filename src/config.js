@@ -152,7 +152,7 @@ export function buildConfig(env = process.env) {
 
     /* Chains a user may pay from. Server-side because it is a safety rule, not
        a preference: an unlisted chain means an unaudited route. */
-    allowedChainIds: (env.ALLOWED_CHAIN_IDS ?? '8453,1,42161,10,4663')
+    allowedChainIds: (env.ALLOWED_CHAIN_IDS ?? '8453,1,42161,10,4663,56')
       .split(',')
       .map((s) => Number(s.trim()))
       .filter((n) => Number.isInteger(n) && n > 0),

@@ -59,6 +59,13 @@ test('rejects a non-integer port', () => {
   assert.throws(() => buildConfig({ PORT: 'abc' }), /PORT/)
 })
 
+test('allowedChainIds default includes BNB Chain (56) alongside the existing five', () => {
+  // Pins .env.example and this fallback in sync: the source-of-truth default
+  // lives in both places, and only a test catches them drifting apart.
+  const config = buildConfig({})
+  assert.deepEqual(config.allowedChainIds, [8453, 1, 42161, 10, 4663, 56])
+})
+
 test('background refresh interval and cold-start wait budget have sensible defaults', () => {
   const config = buildConfig({})
   assert.equal(config.refreshIntervalMs, 20000)

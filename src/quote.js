@@ -14,7 +14,9 @@ import { fetchRelayQuote, fetchRelayStatus } from './sources/relay.js'
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/
 
-/** Native ETH, which is what every allowed source chain pays with. */
+/** The chain's native asset — Relay's zero address means "native," whatever
+    that is on the source chain (ETH, BNB, …), which is what every allowed
+    source chain pays with. */
 const NATIVE = '0x0000000000000000000000000000000000000000'
 
 /** Decimal string -> integer wei string, without floating point. */
@@ -110,7 +112,7 @@ export function createQuoteService({ config, fetchImpl = fetch }) {
     }
 
     /* Checked after quoting rather than before, because the minimum is in USD
-       and only Relay knows what the user's ETH is worth right now. */
+       and only Relay knows what the user's native asset is worth right now. */
     if (inUsd < config.minTradeUsd) {
       throw new Error(
         `minimum trade is $${config.minTradeUsd} — fixed costs would exceed 5% below that`,
@@ -141,8 +143,9 @@ export function createQuoteService({ config, fetchImpl = fetch }) {
       amountOut,
       amountInUsd: inUsd,
       amountOutUsd: num(d.currencyOut?.amountUsd),
-      // Tokens per 1 ETH. Derived rather than read, so it always agrees with
-      // the two amounts shown directly above it in the UI.
+      // Tokens per 1 unit of the source chain's native asset. Derived rather
+      // than read, so it always agrees with the two amounts shown directly
+      // above it in the UI.
       rate: amountIn > 0 ? amountOut / amountIn : 0,
       /* A fraction, not a percentage: the widget's formatPct multiplies by 100.
          Relay's "-5.12" passed through unchanged would render "-512.00%". */
@@ -215,6 +218,7 @@ export function createQuoteService({ config, fetchImpl = fetch }) {
 const CHAIN_NAMES = {
   1: 'Ethereum',
   10: 'Optimism',
+  56: 'BNB Chain',
   8453: 'Base',
   42161: 'Arbitrum',
   4663: 'Robinhood Chain',

@@ -193,6 +193,23 @@ test('rejects a chain that is not allowlisted', async () => {
   )
 })
 
+test('accepts chain 56 (BNB Chain) as an allowed source', async () => {
+  // Same fixture as the Base-origin tests above — this test's only concern is
+  // that 56 clears the allowlist gate and reaches Relay, not the fixture's
+  // own (Base-shaped) numbers. originChainId is asserted separately below so
+  // a regression that silently drops or overwrites the caller's chain id
+  // still fails here even though the response body wouldn't show it.
+  const fetchImpl = ok()
+  const svc = createQuoteService({ config, fetchImpl })
+  const q = await svc.getQuote({ user: USER, chainId: 56, amount: '0.02' })
+  assert.equal(q.mock, false)
+  const body = JSON.parse(fetchImpl.calls[0].init.body)
+  assert.equal(body.originChainId, 56)
+  // route is built from CHAIN_NAMES[origin], not the fixture — this is the
+  // direct regression test for the "56: 'BNB Chain'" entry.
+  assert.equal(q.route, 'BNB Chain to Robinhood Chain, one transaction')
+})
+
 test('rejects a malformed user address', async () => {
   const svc = createQuoteService({ config, fetchImpl: ok() })
   await assert.rejects(
