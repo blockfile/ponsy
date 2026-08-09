@@ -5,7 +5,7 @@ Target: Ubuntu 24.04 droplet at **152.42.239.56**, serving **api.ponsy.fun** onl
 **`ponsy.fun` is on Netlify and stays there.** It resolves to
 `13.215.239.219` / `52.74.6.109` and answers with `Server: Netlify` — a
 different host entirely. Do not point it at this droplet. The only change on the
-frontend side is one Netlify environment variable (Step 7).
+frontend side is Netlify environment variables (Step 7).
 
 As of the last check the droplet has **only port 22 open** — 80, 443 and 3000 are
 closed, so nothing is being served yet.
@@ -109,11 +109,10 @@ cp .env.example .env
 nano .env
 ```
 
-Set these four. Everything else can stay at its default:
+Set these three. Everything else can stay at its default:
 
 ```ini
 TOKEN_ADDRESS=0xYourPonsyContract
-POOL_ADDRESS=0xYourUniswapV3PonsyWethPool
 CORS_ORIGIN=https://ponsy.fun,https://www.ponsy.fun
 HOST=127.0.0.1
 ```
@@ -123,6 +122,15 @@ blocks the request otherwise and the panel shows its RETRY state.
 
 Leaving `TOKEN_ADDRESS` empty is valid: `/stats` returns nulls and the site shows
 dashes until you fill it in.
+
+**Leave `POOL_ADDRESS` unset.** It only prices a Uniswap **v3** WETH pair, and
+the live PONSY pool is Uniswap **v4** — this reader cannot price it. Setting it
+against the current pool does not enable on-chain pricing (Dexscreener is
+already the correct, working fallback); it only adds a second, sequential RPC
+call inside `readChain` with a ~16s worst case, past nginx's 15s
+`proxy_read_timeout` in Step 5 below — that combination is the exact cause of
+a prior production 504 outage. Only set `POOL_ADDRESS` once the pool it points
+at is confirmed to be a Uniswap v3 WETH pair.
 
 ```bash
 chmod 600 .env
@@ -208,7 +216,14 @@ No code change. In the Netlify dashboard for `ponsy.fun`:
 
 ```
 VITE_STATS_URL = https://api.ponsy.fun/stats
+VITE_QUOTE_URL = https://api.ponsy.fun/quote
 ```
+
+`VITE_QUOTE_URL` must have **no trailing slash**. The frontend derives its
+status-poll endpoint by appending `/status` to this value, so a trailing
+slash turns that into `/quote//status`, which this API 404s — every
+otherwise-successful swap then sits unconfirmed for 3 minutes before
+degrading to "sent, but we couldn't confirm the outcome."
 
 Then **Deploys → Trigger deploy → Clear cache and deploy site**.
 
@@ -217,7 +232,9 @@ an env var added without redeploying changes nothing.
 
 Confirm in the browser at `ponsy.fun` — the MARKET CAP and HOLDERS panels should
 show figures instead of dashes, and the "LIVE FIGURES ON LAUNCH" caption
-disappears on its own once `VITE_STATS_URL` is set.
+disappears on its own once `VITE_STATS_URL` is set. The swap widget should
+price instead of showing "SWAP PRICING NOT CONFIGURED" once `VITE_QUOTE_URL`
+is set.
 
 ---
 
@@ -231,8 +248,8 @@ Read `source` in the response:
 
 | `source.price` | Meaning |
 | --- | --- |
-| `pool` | Priced on-chain from your RPC. This is the healthy path. |
-| `dexscreener` | Pool read failed or `POOL_ADDRESS` is unset — check `warnings`. |
+| `pool` | Priced on-chain from your RPC. Only reachable with `POOL_ADDRESS` set to a Uniswap **v3** WETH pair — see the warning in Step 3 before setting it. |
+| `dexscreener` | The expected, healthy result with `POOL_ADDRESS` unset, which is the current recommendation (Step 3) — not a fallback to chase. If `POOL_ADDRESS` *is* set and you still see this, check `warnings`. |
 | `none` | No price at all. `warnings` says why. |
 
 `"placeholder": true` means `TOKEN_ADDRESS` is still empty.

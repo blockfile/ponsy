@@ -25,13 +25,18 @@ npm run probe             # check each upstream and print what it returned
 
 ## Going live — the whole checklist
 
-**1. In this project's `.env`,** set the token (and ideally the pool):
+**1. In this project's `.env`,** set the token:
 
 ```ini
 TOKEN_ADDRESS=0xYourPonsyContract
-POOL_ADDRESS=0xYourUniswapV3PonsyWethPool   # optional but preferred
 CORS_ORIGIN=https://your-site.com
 ```
+
+Leave `POOL_ADDRESS` unset unless your pool is confirmed Uniswap **v3** —
+see *Where the numbers come from* below. The live PONSY pool is v4, which
+this reader cannot price; setting `POOL_ADDRESS` against it does not enable
+on-chain pricing and reintroduces a 504 risk (a prior production incident)
+via a second sequential RPC call in `readChain`.
 
 **2. In the frontend's `.env`** (`D:\Jarred\test\Meme4\.env`), one line:
 
@@ -90,8 +95,8 @@ Liveness. Touches no upstream, so it stays up when they don't.
 | --- | --- | --- |
 | **holders** | Blockscout `/tokens/{addr}/counters` | A plain RPC node cannot answer "how many addresses hold this token". Answering it means replaying every Transfer since deployment — the indexing the explorer already does. |
 | **supply** | your RPC, `totalSupply()` + `decimals()` | Authoritative and free. |
-| **price** | your RPC, pool `slot0()` → × ETH/USD | Correct the moment your pool has liquidity. Dexscreener can lag a fresh pair by hours. |
-| **price** (fallback) | Dexscreener `priceUsd` | Used when the pool read fails or `POOL_ADDRESS` is unset. |
+| **price** | your RPC, pool `slot0()` → × ETH/USD | Only used when `POOL_ADDRESS` is set to a Uniswap **v3** WETH pair — the reader cannot price v4. Leave `POOL_ADDRESS` unset against the current (v4) PONSY pool; see `.env.example`. |
+| **price** (fallback) | Dexscreener `priceUsd` | The expected, healthy path with `POOL_ADDRESS` unset — not a degraded fallback to chase. Used whenever the pool read fails too. |
 | **ETH/USD** | Blockscout `/stats` `coin_price` | Already published by the explorer — no extra key or dependency. |
 
 No API keys. No database.
@@ -175,5 +180,6 @@ docs/superpowers/specs/ design document
 ## Configuration
 
 Every variable is documented in `.env.example`. The upstream defaults are
-already correct for Robinhood Chain; in normal use `TOKEN_ADDRESS`,
-`POOL_ADDRESS` and `CORS_ORIGIN` are the only ones you set.
+already correct for Robinhood Chain; in normal use `TOKEN_ADDRESS` and
+`CORS_ORIGIN` are the only ones you set. Leave `POOL_ADDRESS` unset — see
+`.env.example` for why.
