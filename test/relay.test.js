@@ -42,6 +42,19 @@ test('POSTs a well-formed quote request', async () => {
   assert.equal(body.recipient, PARAMS.user, 'recipient defaults to the sender')
 })
 
+test('forwards an explicit recipient instead of collapsing it to the sender', async () => {
+  // Needed for a Solana origin: the payer (base58) has no EVM address, so
+  // quote.js must be able to name a different, real destination — collapsing
+  // back to `user` here would silently misroute a cross-VM swap.
+  const fetchImpl = stubFetch([['/quote', async () => RELAY_QUOTE]])
+  const recipient = '0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E'
+  await fetchRelayQuote('https://api.relay.link', { ...PARAMS, recipient }, { fetchImpl })
+
+  const body = JSON.parse(fetchImpl.calls[0].init.body)
+  assert.equal(body.recipient, recipient)
+  assert.equal(body.user, PARAMS.user, 'user (the payer) is unaffected')
+})
+
 test('returns the raw Relay payload untouched', async () => {
   const fetchImpl = stubFetch([['/quote', async () => RELAY_QUOTE]])
   const out = await fetchRelayQuote('https://api.relay.link', PARAMS, { fetchImpl })

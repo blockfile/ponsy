@@ -22,9 +22,12 @@ export async function fetchRelayQuote(baseUrl, params, { timeoutMs = 15000, sign
     headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
     body: JSON.stringify({
       user: params.user,
-      /* The payer receives the tokens. A separate recipient is a footgun we
-         have no use for: it would let a caller direct someone else's funds. */
-      recipient: params.user,
+      /* Defaults to the payer when the caller supplies no recipient — the
+         same behaviour as before a separate recipient existed. Now explicit
+         for a Solana origin: a Solana keypair has no EVM address, so
+         quote.js passes the real 0x destination through here rather than
+         letting it silently collapse back to the (base58) payer. */
+      recipient: params.recipient ?? params.user,
       originChainId: params.originChainId,
       destinationChainId: params.destinationChainId,
       originCurrency: params.originCurrency,

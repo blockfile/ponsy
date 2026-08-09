@@ -59,11 +59,16 @@ test('rejects a non-integer port', () => {
   assert.throws(() => buildConfig({ PORT: 'abc' }), /PORT/)
 })
 
-test('allowedChainIds default includes BNB Chain (56) alongside the existing five', () => {
+test('allowedChainIds default includes BNB Chain (56) and Solana (792703809) alongside the original four', () => {
   // Pins .env.example and this fallback in sync: the source-of-truth default
   // lives in both places, and only a test catches them drifting apart.
   const config = buildConfig({})
-  assert.deepEqual(config.allowedChainIds, [8453, 1, 42161, 10, 4663, 56])
+  assert.deepEqual(config.allowedChainIds, [8453, 1, 42161, 10, 4663, 56, 792703809])
+})
+
+test('SOLANA_RPC_URL defaults to the public Solana mainnet endpoint', () => {
+  const config = buildConfig({})
+  assert.equal(config.solanaRpcUrl, 'https://api.mainnet-beta.solana.com')
 })
 
 test('background refresh interval and cold-start wait budget have sensible defaults', () => {

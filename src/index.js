@@ -6,6 +6,7 @@
 
 import { loadEnvFile, buildConfig } from './config.js'
 import { createRpcClient } from './chain/rpc.js'
+import { createBlockhashProvider } from './chain/solana.js'
 import { createStatsService } from './stats.js'
 import { createQuoteService } from './quote.js'
 import { createCache } from './cache.js'
@@ -46,7 +47,8 @@ const refresher = createRefresher({
   intervalMs: config.refreshIntervalMs,
 })
 
-const quoteService = createQuoteService({ config })
+const blockhash = createBlockhashProvider({ rpcUrl: config.solanaRpcUrl })
+const quoteService = createQuoteService({ config, blockhash })
 
 const app = createServer({ config, statsService, quoteService, cache })
 

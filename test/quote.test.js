@@ -2,8 +2,11 @@ import test from 'node:test'
 import assert from 'node:assert/strict'
 
 import { buildConfig } from '../src/config.js'
-import { createQuoteService, toWei } from '../src/quote.js'
-import { RELAY_QUOTE, RELAY_STATUS_SUCCESS, PONSY_ADDRESS, stubFetch } from './fixtures.js'
+import { createQuoteService, toWei, toLamports } from '../src/quote.js'
+import {
+  RELAY_QUOTE, RELAY_STATUS_SUCCESS, PONSY_ADDRESS, stubFetch,
+  RELAY_SOLANA_QUOTE, SOL_PAYER, EVM_RECIPIENT, SOL_BLOCKHASH,
+} from './fixtures.js'
 
 const USER = '0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E'
 const config = buildConfig({ TOKEN_ADDRESS: PONSY_ADDRESS })
@@ -299,4 +302,116 @@ test('toWei rejects malformed input with its own message, distinct from non-posi
   // Well-formed and positive, but more precision than 18 decimals supports:
   // its own distinct message, unchanged by this fix round.
   assert.throws(() => toWei('0.' + '1'.repeat(19)), /more than 18 decimal places/)
+})
+
+const SOLANA_CHAIN = 792703809
+
+/** A blockhash provider that never touches the network. */
+const stubBlockhash = {
+  get: async () => ({ blockhash: SOL_BLOCKHASH, lastValidBlockHeight: 280000000 }),
+}
+
+/**
+ * Same token as the shared `config` above, but with the $25 USD minimum
+ * lowered to $1.
+ *
+ * The captured Solana fixture (RELAY_SOLANA_QUOTE) is a genuine live quote
+ * for a real 0.25 SOL trade — about $19, below the $25 production default.
+ * These tests exist to pin Solana-specific behaviour (currency selection,
+ * VM-aware validation, transaction assembly), which is orthogonal to the USD
+ * gate; that gate already has its own dedicated tests above, against the EVM
+ * fixture. Reusing the shared $25 `config` here would fail every
+ * success-path Solana test on a check unrelated to what each test verifies.
+ */
+function solanaTestConfig() {
+  return buildConfig({ TOKEN_ADDRESS: PONSY_ADDRESS, MIN_TRADE_USD: '1' })
+}
+
+function solanaService(overrides = {}) {
+  return createQuoteService({
+    config: solanaTestConfig(),
+    fetchImpl: stubFetch([['/quote', async () => RELAY_SOLANA_QUOTE]]),
+    blockhash: stubBlockhash,
+    ...overrides,
+  })
+}
+
+test('accepts a base58 payer for a Solana origin', async () => {
+  const q = await solanaService().getQuote({
+    user: SOL_PAYER, chainId: SOLANA_CHAIN, amount: '0.25', recipient: EVM_RECIPIENT,
+  })
+  assert.ok(q.solanaTx, 'a Solana quote must carry solanaTx')
+  assert.equal(q.tx, undefined, 'and must NOT carry an EVM tx')
+})
+
+test('returns a base64 transaction and the blockhash expiry', async () => {
+  const q = await solanaService().getQuote({
+    user: SOL_PAYER, chainId: SOLANA_CHAIN, amount: '0.25', recipient: EVM_RECIPIENT,
+  })
+  assert.match(q.solanaTx.base64, /^[A-Za-z0-9+/]+=*$/)
+  assert.equal(q.solanaTx.lastValidBlockHeight, 280000000)
+})
+
+test('sends SOL as the origin currency and the EVM address as the recipient', async () => {
+  const fetchImpl = stubFetch([['/quote', async () => RELAY_SOLANA_QUOTE]])
+  await createQuoteService({ config: solanaTestConfig(), fetchImpl, blockhash: stubBlockhash }).getQuote({
+    user: SOL_PAYER, chainId: SOLANA_CHAIN, amount: '0.25', recipient: EVM_RECIPIENT,
+  })
+  const body = JSON.parse(fetchImpl.calls[0].init.body)
+
+  assert.equal(body.originCurrency, '11111111111111111111111111111111')
+  assert.equal(body.originChainId, SOLANA_CHAIN)
+  assert.equal(body.user, SOL_PAYER)
+  assert.equal(body.recipient, EVM_RECIPIENT, 'the EVM wallet receives, not the payer')
+  assert.equal(body.destinationCurrency, PONSY_ADDRESS.toLowerCase())
+})
+
+test('rejects a Solana origin with no recipient — never guess a destination', async () => {
+  await assert.rejects(
+    () => solanaService().getQuote({ user: SOL_PAYER, chainId: SOLANA_CHAIN, amount: '0.25' }),
+    /recipient/i,
+  )
+})
+
+test('rejects an EVM address as the payer on a Solana origin', async () => {
+  await assert.rejects(
+    () => solanaService().getQuote({
+      user: EVM_RECIPIENT, chainId: SOLANA_CHAIN, amount: '0.25', recipient: EVM_RECIPIENT,
+    }),
+    /base58|Solana/i,
+  )
+})
+
+test('rejects a base58 payer on an EVM origin', async () => {
+  await assert.rejects(
+    () => solanaService().getQuote({ user: SOL_PAYER, chainId: 8453, amount: '0.02' }),
+    /user must be/,
+  )
+})
+
+test('EVM quotes still default the recipient to the payer', async () => {
+  const fetchImpl = ok()
+  await createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
+    user: USER, chainId: 8453, amount: '0.02',
+  })
+  const body = JSON.parse(fetchImpl.calls[0].init.body)
+  assert.equal(body.recipient, USER, 'unchanged EVM behaviour')
+})
+
+test('still emits marketCap-style shared fields for a Solana quote', async () => {
+  const q = await solanaService().getQuote({
+    user: SOL_PAYER, chainId: SOLANA_CHAIN, amount: '0.25', recipient: EVM_RECIPIENT,
+  })
+  assert.equal(q.amountIn, 0.25)
+  assert.ok(Math.abs(q.amountOut - 86623.618) < 0.001)
+  assert.ok(Math.abs(q.priceImpact - 0.0016) < 1e-9)
+  assert.equal(q.timeEstimate, 3)
+  assert.match(q.requestId, /^0x/)
+})
+
+test('toLamports converts a decimal SOL string to integer lamports, at 9 decimals', () => {
+  // Mirrors toWei's own pinning test, at SOL's 9 decimals instead of 18 —
+  // 0.25 SOL is exactly the 250000000 lamports the live fixture captures.
+  assert.equal(toLamports('0.25'), '250000000')
+  assert.equal(toLamports('1'), '1000000000')
 })

@@ -11,6 +11,7 @@
  */
 
 import { fetchRelayQuote, fetchRelayStatus } from './sources/relay.js'
+import { buildSolanaTransaction } from './chain/solana.js'
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/
 
@@ -18,6 +19,19 @@ const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/
     that is on the source chain (ETH, BNB, …), which is what every allowed
     source chain pays with. */
 const NATIVE = '0x0000000000000000000000000000000000000000'
+
+/** Relay's id for Solana, and SOL's currency identifier. Verified live. */
+export const SOLANA_CHAIN_ID = 792703809
+const SOL_CURRENCY = '11111111111111111111111111111111'
+
+/* Base58 excludes 0, O, I and l precisely so addresses cannot be misread.
+   Length is 32-44 characters for a 32-byte key. */
+const BASE58_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/
+
+/** Solana pays in SOL; every EVM source chain pays in its own native asset. */
+function originCurrencyFor(chainId) {
+  return chainId === SOLANA_CHAIN_ID ? SOL_CURRENCY : NATIVE
+}
 
 /** Decimal string -> integer wei string, without floating point. */
 export function toWei(amount, decimals = 18) {
@@ -34,6 +48,11 @@ export function toWei(amount, decimals = 18) {
     throw new Error(`amount must be a positive number, got: ${amount}`)
   }
   return padded
+}
+
+/** SOL has 9 decimals, not 18. Same exact-integer path as toWei. */
+export function toLamports(amount) {
+  return toWei(amount, 9)
 }
 
 /** Raw integer string -> whole tokens as a Number. */
@@ -68,29 +87,46 @@ function parseGasLimit(value) {
   return Number.isInteger(n) && n > 0 ? n : undefined
 }
 
-export function createQuoteService({ config, fetchImpl = fetch }) {
-  async function getQuote({ user, chainId, amount }) {
+export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
+  async function getQuote({ user, chainId, amount, recipient, signal }) {
     if (!config.tokenAddress) {
       throw new Error('TOKEN_ADDRESS is not set')
-    }
-    if (!ADDRESS_RE.test(String(user ?? ''))) {
-      throw new Error('user must be a 0x-prefixed 40-hex-character address')
     }
     const origin = Number(chainId)
     if (!config.allowedChainIds.includes(origin)) {
       throw new Error(`chain ${chainId} is not supported`)
     }
 
+    const isSolana = origin === SOLANA_CHAIN_ID
+
+    if (isSolana) {
+      if (!BASE58_RE.test(String(user ?? ''))) {
+        throw new Error('user must be a base58 Solana address for a Solana origin')
+      }
+      /* A Solana keypair has no EVM address, so the destination cannot be
+         derived — it has to be supplied. Guessing one would send PONSY
+         somewhere unrecoverable. */
+      if (!ADDRESS_RE.test(String(recipient ?? ''))) {
+        throw new Error('recipient must be a 0x address when paying from Solana')
+      }
+    } else if (!ADDRESS_RE.test(String(user ?? ''))) {
+      throw new Error('user must be a 0x-prefixed 40-hex-character address')
+    }
+
+    /* On EVM the payer receives, exactly as before. */
+    const receiver = isSolana ? recipient : user
+
     const raw = await fetchRelayQuote(
       config.relayUrl,
       {
         user,
+        recipient: receiver,
         originChainId: origin,
         destinationChainId: 4663,
-        originCurrency: NATIVE,
+        originCurrency: originCurrencyFor(origin),
         // Fixed. Deliberately ignores anything the caller sent.
         destinationCurrency: config.tokenAddress,
-        amount: toWei(amount),
+        amount: isSolana ? toLamports(amount) : toWei(amount),
       },
       { fetchImpl, timeoutMs: config.upstreamTimeoutMs },
     )
@@ -123,19 +159,85 @@ export function createQuoteService({ config, fetchImpl = fetch }) {
     const amountOut = num(d.currencyOut?.amountFormatted)
     const amountIn = num(d.currencyIn?.amountFormatted)
     const item = raw?.steps?.[0]?.items?.[0]
-    const gasLimit = parseGasLimit(item?.data?.gas)
 
-    if (!item?.data?.to) {
-      throw new Error('Relay returned no transaction to sign')
-    }
-    /* `from` is forwarded to the frontend and relied on by two independent
-       downstream guards: the wallet only gets to validate its selected
-       account against a `from` that actually exists on `tx`, and the
-       frontend's own account-match check (`if (from && ...)`) skips
-       entirely when `from` is absent — silently, not fail-closed. Refuse
-       here rather than let a Relay response with no `from` defeat both. */
-    if (!item?.data?.from) {
-      throw new Error('Relay returned no sending account for the transaction')
+    /* Solana and EVM quotes carry incompatible signing payloads — one an
+       instruction list, the other calldata — so exactly one of solanaTx/tx is
+       built here and spread into the response below. Never both, never
+       neither: a frontend that hasn't been updated for the other VM must fail
+       loudly on an undefined field rather than sign something meaningless. */
+    let txField
+    if (isSolana) {
+      const ixs = item?.data?.instructions
+      if (!Array.isArray(ixs) || ixs.length === 0) {
+        throw new Error('Relay returned no Solana instructions to sign')
+      }
+      const { blockhash: hash, lastValidBlockHeight } = await blockhash.get({ signal })
+      txField = {
+        solanaTx: {
+          base64: buildSolanaTransaction({
+            instructions: ixs,
+            feePayer: user,
+            blockhash: hash,
+          }),
+          lastValidBlockHeight,
+        },
+      }
+    } else {
+      const gasLimit = parseGasLimit(item?.data?.gas)
+
+      if (!item?.data?.to) {
+        throw new Error('Relay returned no transaction to sign')
+      }
+      /* `from` is forwarded to the frontend and relied on by two independent
+         downstream guards: the wallet only gets to validate its selected
+         account against a `from` that actually exists on `tx`, and the
+         frontend's own account-match check (`if (from && ...)`) skips
+         entirely when `from` is absent — silently, not fail-closed. Refuse
+         here rather than let a Relay response with no `from` defeat both. */
+      if (!item?.data?.from) {
+        throw new Error('Relay returned no sending account for the transaction')
+      }
+
+      txField = {
+        tx: {
+          /* Carried through because some wallets reject eth_sendTransaction
+             without an explicit `from`. Relay echoes back the `user` we sent, so
+             this is the connected account by construction. */
+          from: item.data.from,
+          to: item.data.to,
+          data: item.data.data,
+          value: String(item.data.value ?? '0'),
+          chainId: item.data.chainId,
+          /* Gas LIMIT, forwarded as a genuine JS number (see parseGasLimit) —
+             never stringified, never hex-encoded. The frontend's buildTxParams
+             already hex-encodes it via toHexQuantityLoose before it reaches the
+             wallet. Dropping this field is exactly what sent a real Base user's
+             MetaMask into eth_estimateGas failure, a fallback to the block gas
+             limit (140,000,000), and an Infura per-tx cap rejection — the real
+             requirement was 32,713, about 4,280x smaller. Omitted entirely
+             (never null/0/undefined as a key) when Relay doesn't supply a
+             usable one, so the wallet falls back to its own estimation —
+             correct behaviour on chains where estimation actually works, and
+             merely the status quo on Base. A present-but-zero limit would be
+             strictly worse than omission everywhere, so it is not treated as
+             "supplied" either.
+
+             Deliberately does NOT include maxFeePerGas / maxPriorityFeePerGas.
+             Those are *prices*, not limits, and Relay's numbers are a snapshot
+             taken at quote time — by the time the wallet signs and sends, the
+             network's fee market has moved. Pinning a stale, possibly too-low
+             maxFeePerGas produces a transaction that just sits unmined; a
+             wallet's own fee estimator reads current conditions and will
+             always do this better than a several-second-old quote. The gas
+             *limit* has no such staleness problem: it's a property of the call
+             itself (what this exact calldata costs to execute), which is why
+             Relay can compute it up front and the wallet cannot without first
+             trying and failing. Do not "complete the set" by adding the fee
+             fields here — that would trade one class of broken transaction for
+             another. */
+          ...(gasLimit !== undefined ? { gas: gasLimit } : {}),
+        },
+      }
     }
 
     return {
@@ -161,44 +263,7 @@ export function createQuoteService({ config, fetchImpl = fetch }) {
       feeUsd: num(raw?.fees?.relayer?.amountUsd) + num(raw?.fees?.app?.amountUsd),
       timeEstimate: num(d.timeEstimate),
       route: `${originName(origin)} to Robinhood Chain, one transaction`,
-      tx: {
-        /* Carried through because some wallets reject eth_sendTransaction
-           without an explicit `from`. Relay echoes back the `user` we sent, so
-           this is the connected account by construction. */
-        from: item.data.from,
-        to: item.data.to,
-        data: item.data.data,
-        value: String(item.data.value ?? '0'),
-        chainId: item.data.chainId,
-        /* Gas LIMIT, forwarded as a genuine JS number (see parseGasLimit) —
-           never stringified, never hex-encoded. The frontend's buildTxParams
-           already hex-encodes it via toHexQuantityLoose before it reaches the
-           wallet. Dropping this field is exactly what sent a real Base user's
-           MetaMask into eth_estimateGas failure, a fallback to the block gas
-           limit (140,000,000), and an Infura per-tx cap rejection — the real
-           requirement was 32,713, about 4,280x smaller. Omitted entirely
-           (never null/0/undefined as a key) when Relay doesn't supply a
-           usable one, so the wallet falls back to its own estimation —
-           correct behaviour on chains where estimation actually works, and
-           merely the status quo on Base. A present-but-zero limit would be
-           strictly worse than omission everywhere, so it is not treated as
-           "supplied" either.
-
-           Deliberately does NOT include maxFeePerGas / maxPriorityFeePerGas.
-           Those are *prices*, not limits, and Relay's numbers are a snapshot
-           taken at quote time — by the time the wallet signs and sends, the
-           network's fee market has moved. Pinning a stale, possibly too-low
-           maxFeePerGas produces a transaction that just sits unmined; a
-           wallet's own fee estimator reads current conditions and will
-           always do this better than a several-second-old quote. The gas
-           *limit* has no such staleness problem: it's a property of the call
-           itself (what this exact calldata costs to execute), which is why
-           Relay can compute it up front and the wallet cannot without first
-           trying and failing. Do not "complete the set" by adding the fee
-           fields here — that would trade one class of broken transaction for
-           another. */
-        ...(gasLimit !== undefined ? { gas: gasLimit } : {}),
-      },
+      ...txField,
       requestId: raw?.steps?.[0]?.requestId ?? null,
       mock: false,
     }
@@ -222,6 +287,7 @@ const CHAIN_NAMES = {
   8453: 'Base',
   42161: 'Arbitrum',
   4663: 'Robinhood Chain',
+  792703809: 'Solana',
 }
 function originName(id) {
   return CHAIN_NAMES[id] ?? `Chain ${id}`
