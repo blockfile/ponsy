@@ -82,6 +82,31 @@ test('GET /stats sets Cache-Control matching the TTL', async () => {
   })
 })
 
+test('a second request within the TTL is served from cache, without calling statsService again', async () => {
+  /* The point of the background refresher (refresher.js) is that GET /stats
+     answers from memory. This pins the request-side half of that contract at
+     the HTTP layer: whatever populated the cache — the refresher's timer or,
+     as here, a first request — a second request inside the TTL must not
+     re-invoke the stats service ("upstreams" from the route's point of
+     view). CONFIG's TTL is the 30s default, so it is still fresh here. */
+  let calls = 0
+  const collect = async () => {
+    calls++
+    return PAYLOAD
+  }
+
+  await withServer({ config: CONFIG, collect }, async (get) => {
+    const first = await get('/stats')
+    assert.equal(first.status, 200)
+
+    const second = await get('/stats')
+    assert.equal(second.status, 200)
+    assert.deepEqual(await second.json().then((b) => b.marketCap), PAYLOAD.marketCap)
+
+    assert.equal(calls, 1, 'the second request must not re-invoke the stats service')
+  })
+})
+
 test('allows a configured origin and sets Vary', async () => {
   await withServer({ config: CONFIG, collect: async () => PAYLOAD }, async (get) => {
     const res = await get('/stats', { headers: { Origin: 'http://localhost:5173' } })
@@ -135,6 +160,37 @@ test('returns 503 when collection fails with nothing cached', async () => {
       assert.equal(body.error, 'stats unavailable')
     },
   )
+})
+
+test('GET /stats degrades within the wait budget instead of hanging on a cold cache', async () => {
+  /* Models the production incident: nothing cached yet (or the refresher's
+     current cycle is running long) and collection is slow. Before this fix,
+     the request just waited on collect() — up to 16s, past nginx's 15s
+     proxy_read_timeout, a 504. Now the wait is bounded by STATS_WAIT_MS: the
+     request must come back well inside that budget, degrading to a 503
+     rather than hanging, while the slow collect() is left to finish on its
+     own and land in the cache for the next request. */
+  const config = buildConfig({ TOKEN_ADDRESS, STATS_WAIT_MS: 50 })
+
+  const collect = () =>
+    new Promise((resolve) => {
+      const t = setTimeout(() => resolve(PAYLOAD), 2000)
+      t.unref?.()
+    })
+
+  await withServer({ config, collect }, async (get) => {
+    const startedAt = Date.now()
+    const res = await get('/stats')
+    const elapsedMs = Date.now() - startedAt
+
+    assert.equal(res.status, 503)
+    const body = await res.json()
+    assert.match(body.error, /warming/)
+    assert.ok(
+      elapsedMs < 1000,
+      `expected a prompt response well inside the 2000ms collection delay, took ${elapsedMs}ms`,
+    )
+  })
 })
 
 test('serves the last good payload with stale:true after a failure', async () => {

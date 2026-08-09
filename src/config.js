@@ -177,5 +177,20 @@ export function buildConfig(env = process.env) {
       8_000,
       'UPSTREAM_TIMEOUT_MS',
     ),
+
+    /* How often the background refresher (src/refresher.js) re-collects stats
+       and writes them into the cache. Kept below cacheTtlMs so the timer, not
+       an inbound request, is almost always what pays collect()'s latency. */
+    refreshIntervalMs: parsePositiveInt(
+      env.REFRESH_INTERVAL_MS,
+      20_000,
+      'REFRESH_INTERVAL_MS',
+    ),
+
+    /* Caps how long GET /stats will wait on a cold cache (nothing collected
+       yet) before degrading to a 503 rather than hanging. Deliberately well
+       under both collect()'s ~8s worst case and nginx's 15s proxy_read_timeout
+       — see server.js's withDeadline(). */
+    statsWaitMs: parsePositiveInt(env.STATS_WAIT_MS, 5_000, 'STATS_WAIT_MS'),
   })
 }

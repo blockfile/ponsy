@@ -58,3 +58,19 @@ test('supports a wildcard CORS origin', () => {
 test('rejects a non-integer port', () => {
   assert.throws(() => buildConfig({ PORT: 'abc' }), /PORT/)
 })
+
+test('background refresh interval and cold-start wait budget have sensible defaults', () => {
+  const config = buildConfig({})
+  assert.equal(config.refreshIntervalMs, 20000)
+  assert.equal(config.statsWaitMs, 5000)
+  assert.ok(
+    config.refreshIntervalMs < config.cacheTtlMs,
+    'the refresh interval must stay ahead of the cache TTL, or the cache goes stale between refreshes',
+  )
+})
+
+test('REFRESH_INTERVAL_MS and STATS_WAIT_MS are configurable', () => {
+  const config = buildConfig({ REFRESH_INTERVAL_MS: '5000', STATS_WAIT_MS: '1000' })
+  assert.equal(config.refreshIntervalMs, 5000)
+  assert.equal(config.statsWaitMs, 1000)
+})

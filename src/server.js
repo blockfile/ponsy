@@ -36,6 +36,43 @@ function cors(origins) {
   }
 }
 
+/** Distinguishes "the wait budget ran out" from a genuine collection failure. */
+class StatsTimeoutError extends Error {}
+
+/**
+ * Bounds how long a caller waits on `promise`.
+ *
+ * If `promise` settles first, that settlement passes through untouched. If
+ * `ms` elapses first, this rejects with StatsTimeoutError instead — but
+ * `promise` itself is left running, uncancelled. That is deliberate: the
+ * fetch it represents is populating the *shared* cache (see cache.js's
+ * single-flight coalescing and refresher.js), not answering this one caller,
+ * so whichever request happens to be the one that started it should not be
+ * able to cut it short just because that request gave up waiting. Its
+ * eventual result (or failure) still reaches cache.js via the `.then` below,
+ * ready for the next request; its rejection is handled right here so it can
+ * never surface as an unhandled promise rejection.
+ */
+function withDeadline(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new StatsTimeoutError(`stats collection exceeded the ${ms}ms wait budget`)),
+      ms,
+    )
+    timer.unref?.()
+    promise.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
+}
+
 /**
  * @param {object} deps
  * @param {object} deps.config
@@ -59,14 +96,18 @@ export function createServer({ config, statsService, quoteService, cache, logger
   })
 
   app.get('/stats', async (req, res) => {
-    /* Tie the upstream work to the client connection: if the visitor navigates
-       away mid-request, there is no reason to keep waiting on an RPC. */
-    const ac = new AbortController()
-    req.on('close', () => ac.abort())
-
+    /* No per-request AbortController here (deliberately — see withDeadline's
+       comment above): with the background refresher (refresher.js) keeping
+       this cache warm, cache.get() normally returns an already-fresh value
+       in well under a millisecond, without calling statsService.collect() at
+       all. The only time this actually waits on a live collect() is a cold
+       cache — freshly booted, or a sustained upstream outage past the stale
+       window — and withDeadline bounds that wait so this route can never
+       ride collect() all the way to nginx's 15s proxy_read_timeout. */
     try {
-      const { value, stale, updatedAt } = await cache.get(() =>
-        statsService.collect({ signal: ac.signal }),
+      const { value, stale, updatedAt } = await withDeadline(
+        cache.get(() => statsService.collect()),
+        config.statsWaitMs,
       )
 
       /* Let intermediaries cache for the same window we do, so a CDN in front
@@ -82,7 +123,21 @@ export function createServer({ config, statsService, quoteService, cache, logger
         updatedAt: new Date(updatedAt).toISOString(),
       })
     } catch (err) {
-      if (ac.signal.aborted) return // client left; nothing to answer
+      if (err instanceof StatsTimeoutError) {
+        /* Cold start: nothing cached yet and collection is still running in
+           the background (it will land in the cache for the next request —
+           see withDeadline). Degrade honestly and promptly rather than
+           making the visitor, and nginx, wait on it. A 503 here — like the
+           one below — trips the frontend panel's RETRY state, which is an
+           honest description of "no figures available right now" even
+           though the underlying cause (still warming up) differs from a
+           real outage. */
+        logger.warn?.(`[stats] cold start: no cached value within ${config.statsWaitMs}ms`)
+        return res.status(503).json({
+          error: 'stats warming up',
+          detail: 'no cached figures yet; try again shortly',
+        })
+      }
 
       logger.error?.('[stats] all sources failed:', err.message)
 

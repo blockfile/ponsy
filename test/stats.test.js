@@ -120,6 +120,51 @@ test('falls back to Dexscreener when the chain read fails', async () => {
   assert.ok(stats.warnings.some((w) => w.includes('rpc unreachable')))
 })
 
+test('runs the Dexscreener fallback concurrently with the rest, not after it', async () => {
+  /* Regression test for the production 504 incident. Previously, collect()
+     ran holders/chain/ETH-price in Promise.allSettled and THEN, only on
+     failure, awaited Dexscreener sequentially afterwards. With
+     POOL_ADDRESS unset (chain.priceInWeth always null — the production
+     configuration, because the live pool is Uniswap v4 and this reader only
+     prices v3) that "fallback" ran on every request, back to back with the
+     settle group: worst case upstreamTimeoutMs x2 (16s at the 8s default),
+     past nginx's 15s proxy_read_timeout.
+     Each upstream here carries the same artificial delay. If they still ran
+     sequentially, this would take roughly 2x as long as it does. */
+  const DELAY_MS = 200
+  const delay = (ms) => new Promise((r) => setTimeout(r, ms))
+
+  const baseRpc = stubRpc()
+  const rpc = {
+    async ethCallBatch(calls, opts) {
+      await delay(DELAY_MS)
+      return baseRpc.ethCallBatch(calls, opts)
+    },
+  }
+
+  const baseFetch = stubFetch(HAPPY_ROUTES)
+  const fetchImpl = async (url, init) => {
+    await delay(DELAY_MS)
+    return baseFetch(url, init)
+  }
+
+  const svc = createStatsService({
+    config: config({ POOL_ADDRESS: '' }), // forces the Dexscreener path, as in production
+    rpc,
+    fetchImpl,
+  })
+
+  const startedAt = Date.now()
+  const stats = await svc.collect()
+  const elapsedMs = Date.now() - startedAt
+
+  assert.equal(stats.source.price, 'dexscreener')
+  assert.ok(
+    elapsedMs < DELAY_MS * 1.75,
+    `expected concurrent upstream calls (~${DELAY_MS}ms), took ${elapsedMs}ms — looks sequential`,
+  )
+})
+
 test('falls back to Dexscreener when no pool is configured', async () => {
   const svc = createStatsService({
     config: config({ POOL_ADDRESS: '' }),

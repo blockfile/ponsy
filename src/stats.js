@@ -121,12 +121,33 @@ export function createStatsService({ config, rpc, fetchImpl = fetch }) {
     const opts = { ...httpOpts, signal }
     const warnings = []
 
-    /* Fetched together and settled independently: holders and price share no
-       inputs, so an outage in one should not blank the other. */
-    const [holdersRes, chainRes, ethUsdRes] = await Promise.allSettled([
+    /* All four fetched together and settled independently.
+       -----------------------------------------------------------------------
+       The Dexscreener fallback used to run *after* this group, only when the
+       pool path came up empty — sequential by construction: up to
+       upstreamTimeoutMs for the group, then up to another upstreamTimeoutMs
+       for the fallback, worst case 2x. With POOL_ADDRESS unset (the
+       production configuration, because the pool is Uniswap v4 and this
+       reader only prices v3), chain.priceInWeth is null on every single
+       request, so that "fallback" was not a rare path — it ran every time,
+       making the 2x worst case the *typical* case. At the default 8s
+       upstreamTimeoutMs that is 16s, past nginx's 15s proxy_read_timeout: a
+       guaranteed 504.
+
+       Dexscreener has no data dependency on the chain read — supply and
+       decimals come from the RPC, price comes from Dexscreener, and nothing
+       here needs the other's output to start — so there was never a reason
+       to sequence them. Running it concurrently caps collect()'s worst case
+       at one upstreamTimeoutMs (~8s) instead of two, comfortably inside both
+       the 10s target and nginx's 15s ceiling. See stats-latency-fix-report.md
+       for the full arithmetic. When the pool path succeeds, this result is
+       simply discarded (see below) — one extra concurrent request is a fair
+       trade for never blocking on it. */
+    const [holdersRes, chainRes, ethUsdRes, dexRes] = await Promise.allSettled([
       blockscout.fetchHolders(config.blockscoutUrl, config.tokenAddress, opts),
       readChain({ rpc, config, signal }),
       blockscout.fetchNativeUsd(config.blockscoutUrl, opts),
+      dexscreener.fetchPrice(config.dexscreenerUrl, config.tokenAddress, opts),
     ])
 
     let holders = null
@@ -153,18 +174,14 @@ export function createStatsService({ config, rpc, fetchImpl = fetch }) {
     if (chain?.priceInWeth != null && ethUsd != null) {
       priceUsd = chain.priceInWeth * ethUsd
       priceSource = 'pool'
+    } else if (dexRes.status === 'fulfilled') {
+      priceUsd = dexRes.value.priceUsd
+      priceSource = 'dexscreener'
     } else {
-      try {
-        const quote = await dexscreener.fetchPrice(
-          config.dexscreenerUrl,
-          config.tokenAddress,
-          opts,
-        )
-        priceUsd = quote.priceUsd
-        priceSource = 'dexscreener'
-      } catch (err) {
-        warnings.push(`dexscreener fallback failed: ${err.message}`)
-      }
+      /* Only surfaced when the fallback was actually needed and it also
+         failed — not when the pool path succeeded and this concurrent result
+         simply went unused, which is not a warning-worthy event. */
+      warnings.push(`dexscreener fallback failed: ${dexRes.reason?.message}`)
     }
 
     const totalSupply = chain?.supply ?? null
