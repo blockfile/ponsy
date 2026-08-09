@@ -13,6 +13,12 @@ import { createCache } from './cache.js'
 import { createRefresher } from './refresher.js'
 import { createServer } from './server.js'
 
+/* Mirrors `proxy_read_timeout` in deploy/nginx.conf. Duplicated here on
+   purpose: nginx's config is not readable from Node, and the whole point of
+   the check below is that these two numbers live in different files and have
+   twice been changed independently into a 504. Change both together. */
+const NGINX_PROXY_READ_TIMEOUT_MS = 15_000
+
 loadEnvFile()
 
 let config
@@ -69,6 +75,29 @@ const server = app.listen(config.port, config.host, () => {
   console.log(
     `[ponsy-stats] pool       ${config.poolAddress ?? 'UNSET — pricing via Dexscreener fallback'}`,
   )
+  console.log(`[ponsy-stats] waits      stats ${config.statsWaitMs}ms · quote ${config.quoteWaitMs}ms`)
+
+  /* This project has had the SAME outage twice: a wait budget that outlived
+     nginx's proxy_read_timeout, so nginx returned a 504 over a request that
+     was about to succeed. Both times the composition was only visible by
+     reading two files that nobody reads together — an env var here and a
+     directive in deploy/nginx.conf.
+
+     Node cannot read nginx's config, so this warns rather than throws: an
+     operator who has genuinely raised proxy_read_timeout is not doing
+     anything wrong, and refusing to boot over an assumption would be worse
+     than the outage. It prints the actual numbers and names the file to
+     change, because the failure it prevents is silent, intermittent, and
+     reads like an upstream problem rather than a config one. */
+  const budget = Math.max(config.statsWaitMs, config.quoteWaitMs)
+  if (budget >= NGINX_PROXY_READ_TIMEOUT_MS) {
+    console.warn(
+      `[ponsy-stats] WARNING: a wait budget of ${budget}ms meets or exceeds the ` +
+        `${NGINX_PROXY_READ_TIMEOUT_MS}ms proxy_read_timeout in deploy/nginx.conf. ` +
+        `nginx will 504 before this server answers. Lower STATS_WAIT_MS / ` +
+        `QUOTE_WAIT_MS, or raise proxy_read_timeout to match.`,
+    )
+  }
 })
 
 /* Containers stop with SIGTERM; without this the platform waits out its grace

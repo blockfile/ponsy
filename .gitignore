@@ -6,3 +6,8 @@ npm-debug.log*
 .DS_Store
 coverage/
 dist/
+
+# Playwright MCP scratch output (screenshots, page snapshots) from browser
+# verification runs. Useful while checking a change by eye; never part of the
+# repo.
+.playwright-mcp/
