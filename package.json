@@ -14,6 +14,7 @@
     "probe": "node scripts/probe.js"
   },
   "dependencies": {
+    "@solana/web3.js": "^1.98.4",
     "express": "^4.21.2"
   }
 }

@@ -199,3 +199,74 @@ export const RELAY_STATUS_SUCCESS = {
   txHashes: ['0xaaa1'],
   destinationChainId: 4663,
 }
+
+/** The Solana payer and the EVM receiver — different addresses by necessity. */
+export const SOL_PAYER = 'GThUX1Atko4tqhN2NaiTazWSeFWMuiUvfFnyJyUghFMJ'
+export const EVM_RECIPIENT = '0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E'
+
+/** A real blockhash, for deterministic serialisation tests. */
+export const SOL_BLOCKHASH = '5VERd3ffZBLbSUqXtkGxRWjGqzrGZP5nBs7SMDvvBGvS'
+
+/**
+ * POST /quote — 0.25 SOL -> PONSY. Captured 2026-08-09.
+ *
+ * Note `data` is hex with no 0x prefix (48 bytes), and `80b2e60e` at byte
+ * offset 8 is 250000000 lamports little-endian. There are no EVM fields at all.
+ */
+export const RELAY_SOLANA_QUOTE = {
+  steps: [
+    {
+      id: 'deposit',
+      kind: 'transaction',
+      requestId: '0xc43948b87065dbbbeb1f2a9c4d6e8f0a1b2c3d4e5f60718293a4b5c6d7e8f9012',
+      items: [
+        {
+          status: 'incomplete',
+          data: {
+            instructions: [
+              {
+                programId: '99vQwtBwYtrqqD9YSXbdum3KBdxPAVxYTaQ3cfnJSrN2',
+                keys: [
+                  { pubkey: 'Dodg2HifwU8rmaVVyMyUZDGTRbqAJTyVYxXPwcbNpBKc', isSigner: false, isWritable: false },
+                  { pubkey: SOL_PAYER, isSigner: true, isWritable: true },
+                  { pubkey: SOL_PAYER, isSigner: false, isWritable: false },
+                  { pubkey: '7uTT8Xi5RWXzy7h9XL244GRgEycDYDhLjr3ZyNdXi8pZ', isSigner: false, isWritable: true },
+                  { pubkey: '11111111111111111111111111111111', isSigner: false, isWritable: false },
+                ],
+                data: '0d9e0ddf5fd51c0680b2e60e000000005820f2655113737636cb60db5eef7d385b48b1e17a629db5f8cbdf203fde6c2d',
+              },
+            ],
+            addressLookupTableAddresses: ['Hm9fUgcn7qwDaiNTFiGh6pNtVATgnaRcmK6Bbx6EMZfP'],
+          },
+          check: { endpoint: '/intents/status?requestId=0xc43948b8', method: 'GET' },
+        },
+      ],
+    },
+  ],
+  fees: { gas: { amountUsd: '0.000005' }, relayer: { amountUsd: '0.31' }, app: { amountUsd: '0' } },
+  details: {
+    operation: 'swap',
+    currencyIn: {
+      currency: { chainId: 792703809, symbol: 'SOL', decimals: 9 },
+      amount: '250000000', amountFormatted: '0.25', amountUsd: '19.094335',
+    },
+    currencyOut: {
+      currency: { chainId: 4663, address: '0x2e84f2e0b88bd3ffb5d6738ae0e3c7c00137083e', symbol: 'PONSY', decimals: 18 },
+      amount: '86623618000000000000000', amountFormatted: '86623.618', amountUsd: '19.125422',
+      minimumAmount: '84891145640000000000000',
+    },
+    totalImpact: { usd: '0.031087', percent: '0.16' },
+    swapImpact: { usd: '0.02', percent: '0.10' },
+    timeEstimate: 3,
+  },
+}
+
+/** getLatestBlockhash JSON-RPC reply. */
+export const SOL_BLOCKHASH_REPLY = {
+  jsonrpc: '2.0',
+  id: 1,
+  result: {
+    context: { slot: 300000000 },
+    value: { blockhash: SOL_BLOCKHASH, lastValidBlockHeight: 280000000 },
+  },
+}
