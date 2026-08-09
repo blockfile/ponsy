@@ -154,6 +154,36 @@ export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
     /* On EVM the payer receives, exactly as before. */
     const receiver = isSolana ? String(recipient) : payer
 
+    /* Started here — before the Relay round trip — and awaited only where
+       the value is actually used, inside the `isSolana` branch below. The
+       blockhash does not depend on the quote's result, so there is no reason
+       to make it wait on one.
+
+       This used to run strictly after `raw = await fetchRelayQuote(...)`
+       resolved. Both this call and fetchRelayQuote bound themselves at
+       ~config.upstreamTimeoutMs independently (8s by default) — sequencing
+       them composed those two budgets into a ~16s worst case that could
+       outlive nginx's 15s proxy_read_timeout (deploy/nginx.conf) even though
+       neither individual upstream call had itself timed out. This is the
+       same class of bug that produced the /stats outage documented in
+       deploy/DEPLOY.md — two sequential ~8s calls adding up past the same
+       15s ceiling. Starting both here and racing them caps the combined wait
+       at max(quote, blockhash) instead of quote + blockhash.
+
+       The `.catch(() => {})` immediately below is required, not decorative.
+       If `fetchRelayQuote` rejects first (a very normal outcome — a bad
+       route, a down upstream), this promise may still be in flight and
+       nothing has awaited it yet. A promise that rejects with no attached
+       handler becomes an unhandled rejection, and Node's default
+       `--unhandled-rejections=throw` turns that into a process crash — a
+       strictly worse failure than the timeout this change fixes. Attaching
+       a no-op handler the instant the promise is created absorbs that
+       specific hazard without hiding a real failure: `await pendingBlockhash`
+       below still throws normally on its own rejection, for whichever
+       request actually reaches it. */
+    const pendingBlockhash = isSolana ? blockhash.get({ signal }) : null
+    pendingBlockhash?.catch(() => {})
+
     const raw = await fetchRelayQuote(
       config.relayUrl,
       {
@@ -214,7 +244,7 @@ export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
       if (!Array.isArray(ixs) || ixs.length === 0) {
         throw new Error('Relay returned no Solana instructions to sign')
       }
-      const { blockhash: hash, lastValidBlockHeight } = await blockhash.get({ signal })
+      const { blockhash: hash, lastValidBlockHeight } = await pendingBlockhash
       txField = {
         solanaTx: {
           base64: buildSolanaTransaction({

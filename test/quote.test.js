@@ -97,6 +97,10 @@ test('exposes the transaction to sign and the requestId to poll', async () => {
     gas: 32713,
   })
   assert.match(q.requestId, /^0x/)
+  /* The other half of the mutual-exclusivity invariant pinned on the Solana
+     side (see 'accepts a base58 payer for a Solana origin' below): an EVM
+     quote must never carry the Solana signing payload either. */
+  assert.equal(q.solanaTx, undefined, 'an EVM quote must NOT carry solanaTx')
 })
 
 test('forwards gas as a number, never a string or hex, when Relay sends a bare number', async () => {
@@ -376,6 +380,13 @@ test('accepts a base58 payer for a Solana origin', async () => {
   })
   assert.ok(q.solanaTx, 'a Solana quote must carry solanaTx')
   assert.equal(q.tx, undefined, 'and must NOT carry an EVM tx')
+  /* steps and solanaTx are the two VM-specific signing payloads the frontend
+     dispatches on — mutually exclusive by construction (quote.js builds
+     exactly one via its isSolana if/else), but nothing asserted that here
+     before. A regression that started attaching `steps` alongside solanaTx
+     in this branch (eg. a stray fall-through, or a "just in case" default)
+     would stay green without this line. */
+  assert.equal(q.steps, undefined, 'a Solana quote must NOT carry EVM-shaped steps')
   assert.equal(q.vm, 'svm', 'a positive discriminator, not inferred from which tx field is absent')
 })
 
@@ -704,4 +715,128 @@ test('reports vm: "evm" for an EVM origin — a field an executor can always bra
   const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
   const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
   assert.equal(q.vm, 'evm')
+})
+
+test('the EVM path never calls the blockhash provider', async () => {
+  // The blockhash fetch is Solana-only. A regression that started the
+  // blockhash promise unconditionally (eg. hoisting `blockhash.get()` above
+  // the isSolana check to "simplify" the concurrency fix) would waste a
+  // Solana RPC call on every EVM quote and, worse, would throw here — this
+  // stub fails loudly if it is ever invoked.
+  let called = false
+  const neverCalled = {
+    get: async () => {
+      called = true
+      throw new Error('blockhash.get() must not be called on the EVM path')
+    },
+  }
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: neverCalled })
+  const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
+  assert.equal(called, false, 'an EVM quote must never fetch a Solana blockhash')
+  assert.equal(q.vm, 'evm')
+})
+
+test('the Solana path starts the Relay quote and the blockhash fetch concurrently, not sequentially', async () => {
+  /* Timing-independent by construction, per the review's own warning: a test
+     that waits on a clock (eg. asserting elapsed time < 16s) would pass on
+     both the old sequential code and the new concurrent code on a fast
+     enough machine, and flake under CI load either way. Instead this proves
+     overlap directly — both calls must have been STARTED before either is
+     allowed to finish.
+
+     Under the old code, blockhash.get() is only called after `raw = await
+     fetchRelayQuote(...)` has already resolved. Since fetchImpl below never
+     resolves until releaseRelay() is called, the assertions below run while
+     that first await is still pending — so under the old sequential code,
+     blockhashCalled would still be false at that point, and this test fails
+     exactly as intended. */
+  let relayCalled = false
+  let blockhashCalled = false
+  let releaseRelay
+  const relayGate = new Promise((resolve) => { releaseRelay = resolve })
+
+  const fetchImpl = async () => {
+    relayCalled = true
+    await relayGate
+    return { ok: true, status: 200, json: async () => RELAY_SOLANA_QUOTE }
+  }
+  const blockhash = {
+    get: async () => {
+      blockhashCalled = true
+      return { blockhash: SOL_BLOCKHASH, lastValidBlockHeight: 280000000 }
+    },
+  }
+
+  const svc = createQuoteService({ config: solanaTestConfig(), fetchImpl, blockhash })
+  const pending = svc.getQuote({
+    user: SOL_PAYER, chainId: SOLANA_CHAIN, amount: '0.25', recipient: EVM_RECIPIENT,
+  })
+
+  // Both calls have already been issued at this point — synchronously, in
+  // program order, before getQuote's first `await` on the (still-gated)
+  // Relay response yields control back here.
+  assert.equal(relayCalled, true, 'the Relay quote request must have started')
+  assert.equal(
+    blockhashCalled, true,
+    'the blockhash fetch must already be in flight, not waiting on the Relay quote to resolve first',
+  )
+
+  releaseRelay()
+  const q = await pending
+  assert.ok(q.solanaTx, 'the quote must still complete correctly once both calls resolve')
+})
+
+test('a Relay failure on the Solana path does not produce an unhandled rejection', async () => {
+  /* Models the exact trap the concurrency fix has to avoid: the Relay call
+     fails first (a very ordinary outcome), while the blockhash fetch — kicked
+     off concurrently, per the test above — is still in flight and rejects
+     only afterwards. If nothing has attached a handler to that promise by
+     then, Node considers it an unhandled rejection and (under the default
+     --unhandled-rejections=throw) crashes the process — worse than the
+     timeout bug this whole change fixes. This test fails if the no-op
+     `.catch(() => {})` in quote.js is removed: with it removed, the delayed
+     rejection below is observed by nothing (the `isSolana` branch that would
+     `await pendingBlockhash` is never reached, because fetchRelayQuote threw
+     first), so Node emits 'unhandledRejection' and the listener installed
+     below records it, failing the final assertion. */
+  let unhandled = null
+  const onUnhandledRejection = (err) => { unhandled = err }
+  process.on('unhandledRejection', onUnhandledRejection)
+
+  try {
+    const fetchImpl = async () => {
+      throw new Error('Relay is down')
+    }
+    const blockhash = {
+      get: async () => {
+        // Rejects on a later tick, after the Relay failure has already been
+        // thrown and caught below — reproducing "the blockhash promise
+        // nobody has awaited yet rejects with no handler."
+        await new Promise((resolve) => setImmediate(resolve))
+        throw new Error('blockhash RPC failed')
+      },
+    }
+    const svc = createQuoteService({ config: solanaTestConfig(), fetchImpl, blockhash })
+
+    await assert.rejects(
+      () => svc.getQuote({
+        user: SOL_PAYER, chainId: SOLANA_CHAIN, amount: '0.25', recipient: EVM_RECIPIENT,
+      }),
+      /Relay is down/,
+    )
+
+    // Give the event loop several turns so the blockhash promise's delayed
+    // rejection — and, if unhandled, Node's 'unhandledRejection' event for
+    // it — has every opportunity to fire before this test finishes.
+    for (let i = 0; i < 5; i++) {
+      await new Promise((resolve) => setImmediate(resolve))
+    }
+
+    assert.equal(
+      unhandled, null,
+      'the still-pending blockhash promise must not surface as an unhandled rejection',
+    )
+  } finally {
+    process.off('unhandledRejection', onUnhandledRejection)
+  }
 })

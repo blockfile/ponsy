@@ -308,6 +308,52 @@ test('GET /quote returns 400 with the reason when the service rejects', async ()
   )
 })
 
+test('GET /quote returns a timeout, not a hang, when the service exceeds the wait budget', async () => {
+  /* Mirrors the /stats cold-start test above, for the defect this whole
+     change closes: before the concurrency fix and this deadline wrapper, a
+     Solana quote could take up to ~16s (two sequential ~8s upstream calls),
+     past nginx's 15s proxy_read_timeout, for a 504 nginx itself generates
+     with no useful body. Now the route bounds itself at QUOTE_WAIT_MS and
+     answers its own, distinguishable timeout well inside that budget — a
+     stuck-forever getQuote() must not hang this request. */
+  const config = buildConfig({ TOKEN_ADDRESS, QUOTE_WAIT_MS: 50 })
+  const getQuote = () =>
+    new Promise((resolve) => {
+      const t = setTimeout(() => resolve(QUOTE), 2000)
+      t.unref?.()
+    })
+
+  await withServer(
+    {
+      config,
+      collect: async () => PAYLOAD,
+      quoteService: quoteStub({ getQuote }),
+      cacheTtlMs: 0,
+      staleMaxMs: 0,
+    },
+    async (get) => {
+      const startedAt = Date.now()
+      const res = await get(
+        '/quote?amount=0.02&chainId=8453&user=0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E',
+      )
+      const elapsedMs = Date.now() - startedAt
+      const body = await res.json()
+
+      /* 504, not 400: this is the honest, distinct code for "the upstream
+         took too long," not a mistake in what the caller sent — see the
+         comment at this route's catch block in server.js for why the two
+         must not collapse into one status. */
+      assert.equal(res.status, 504)
+      assert.match(body.error, /timed out/)
+      assert.equal(res.headers.get('cache-control'), 'no-store')
+      assert.ok(
+        elapsedMs < 1000,
+        `expected a prompt timeout well inside the 2000ms delay, took ${elapsedMs}ms`,
+      )
+    },
+  )
+})
+
 test('GET /quote forwards recipient from the query string verbatim', async () => {
   // A Solana origin cannot derive its destination from the payer, so this
   // query parameter has to survive the HTTP layer untouched — pin the value

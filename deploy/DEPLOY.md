@@ -132,6 +132,17 @@ call inside `readChain` with a ~16s worst case, past nginx's 15s
 a prior production 504 outage. Only set `POOL_ADDRESS` once the pool it points
 at is confirmed to be a Uniswap v3 WETH pair.
 
+**`STATS_WAIT_MS` and `QUOTE_WAIT_MS` exist for the same reason as the
+`POOL_ADDRESS` warning above, and the same rule applies: don't add a
+sequential upstream call to either `/stats` or `/quote` without re-checking
+the arithmetic against nginx's 15s `proxy_read_timeout` (Step 5).** `/quote`
+originally composed two independent ~8s calls (the Relay quote, then — for a
+Solana origin — a blockhash fetch) sequentially, for the same ~16s worst case
+that caused the `/stats` outage this file already warns about; it now runs
+them concurrently and is bounded by `QUOTE_WAIT_MS` (12s default) as a
+backstop. Leave both at their defaults unless you have a specific reason and
+have done the arithmetic yourself.
+
 ```bash
 chmod 600 .env
 npm run probe        # confirms every upstream is reachable from the droplet

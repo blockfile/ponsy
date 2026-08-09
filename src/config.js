@@ -198,5 +198,20 @@ export function buildConfig(env = process.env) {
        under both collect()'s ~8s worst case and nginx's 15s proxy_read_timeout
        — see server.js's withDeadline(). */
     statsWaitMs: parsePositiveInt(env.STATS_WAIT_MS, 5_000, 'STATS_WAIT_MS'),
+
+    /* Caps how long GET /quote will wait before answering with a timeout
+       instead of hanging. Unlike statsWaitMs, this is NOT meant to fire under
+       normal conditions — a real quote has no cache to fall back to, so
+       degrading early would just turn a slow-but-succeeding quote into a
+       needless failure. It exists as the structural backstop: quote.js now
+       runs the Relay quote and (for a Solana origin) the blockhash fetch
+       concurrently rather than sequentially, which caps their combined worst
+       case at ~upstreamTimeoutMs (max, not sum) — but that arithmetic is easy
+       to re-break the next time a third sequential upstream call is added to
+       this path. 12s clears that ~8s worst case with margin for real network
+       latency and JSON parsing, while staying comfortably under nginx's 15s
+       proxy_read_timeout (deploy/nginx.conf) so this route can never again
+       ride a slow request all the way to a 504 from nginx itself. */
+    quoteWaitMs: parsePositiveInt(env.QUOTE_WAIT_MS, 12_000, 'QUOTE_WAIT_MS'),
   })
 }
