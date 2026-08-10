@@ -840,3 +840,258 @@ test('a Relay failure on the Solana path does not produce an unhandled rejection
     process.off('unhandledRejection', onUnhandledRejection)
   }
 })
+
+/* ---------------------------------------------------------------------------
+   THE NEW SWAP-UI SHAPE: ?from=...&fromNetwork=...&to=ponsy&toNetwork=ponsy
+
+   Meme4's src/lib/swap.js builds:
+     GET /quote?amount=40&from=usdc-eth&fromNetwork=ethereum&to=ponsy&toNetwork=ponsy&slippage=1
+   with NO `user`. This section covers: the asset-key mapping actually
+   reaching Relay with the right chain/currency, `usdc-sol` and unknown keys
+   being refused before Relay, the price-only safety gate (no tx/steps/
+   solanaTx, no blockhash fetch), `user` still producing an executable quote,
+   and the three new response fields.
+--------------------------------------------------------------------------- */
+
+const NATIVE_ADDRESS = '0x0000000000000000000000000000000000000000'
+const CHAIN1_USDC = '0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48'
+
+test('from=eth maps to chain 1, native asset', async () => {
+  const fetchImpl = ok()
+  await createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
+    from: 'eth', amount: '0.02',
+  })
+  const body = JSON.parse(fetchImpl.calls[0].init.body)
+  assert.equal(body.originChainId, 1)
+  assert.equal(body.originCurrency, NATIVE_ADDRESS)
+})
+
+test('from=bnb maps to chain 56, native asset', async () => {
+  const fetchImpl = ok()
+  await createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
+    from: 'bnb', amount: '0.02',
+  })
+  const body = JSON.parse(fetchImpl.calls[0].init.body)
+  assert.equal(body.originChainId, 56)
+  assert.equal(body.originCurrency, NATIVE_ADDRESS)
+})
+
+test('from=usdc-eth maps to chain 1, the USDC token (6 decimals, not 18)', async () => {
+  const fetchImpl = ok()
+  await createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
+    from: 'usdc-eth', amount: '40',
+  })
+  const body = JSON.parse(fetchImpl.calls[0].init.body)
+  assert.equal(body.originChainId, 1)
+  assert.equal(body.originCurrency, CHAIN1_USDC)
+  assert.equal(body.amount, '40000000', '6-decimal scaling — a 10^12 error otherwise')
+})
+
+test('from=sol maps to chain 792703809, native SOL', async () => {
+  const fetchImpl = stubFetch([['/quote', async () => RELAY_SOLANA_QUOTE]])
+  await createQuoteService({
+    config: solanaTestConfig(), fetchImpl, blockhash: stubBlockhash,
+  }).getQuote({ from: 'sol', amount: '0.25' })
+  const body = JSON.parse(fetchImpl.calls[0].init.body)
+  assert.equal(body.originChainId, SOLANA_CHAIN)
+  assert.equal(body.originCurrency, '11111111111111111111111111111111')
+})
+
+test('from=usdc-sol is refused with an actionable message and never reaches Relay', async () => {
+  const fetchImpl = ok()
+  await assert.rejects(
+    () => createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
+      from: 'usdc-sol', amount: '10',
+    }),
+    /USDC on Solana cannot be swapped to PONSY yet\. Try SOL\./,
+  )
+  assert.equal(fetchImpl.calls.length, 0, 'must not reach Relay')
+})
+
+test('an unknown from key is refused with an actionable message and never reaches Relay', async () => {
+  const fetchImpl = ok()
+  await assert.rejects(
+    () => createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
+      from: 'doge', amount: '10',
+    }),
+    /not a supported asset/,
+  )
+  assert.equal(fetchImpl.calls.length, 0, 'must not reach Relay')
+})
+
+test('a from=... request never falls back to a default asset when the key is bad', async () => {
+  // Distinct from the two tests above: this pins that the failure is a
+  // rejection, not a 200 quoting *something* — eg. silently defaulting to
+  // native ETH would price the caller in the wrong currency.
+  const fetchImpl = ok()
+  await assert.rejects(
+    () => createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
+      from: '', amount: '10',
+    }),
+  )
+})
+
+test('rejects a to/toNetwork other than "ponsy" rather than silently ignoring it', async () => {
+  const fetchImpl = ok()
+  await assert.rejects(
+    () => createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
+      from: 'eth', amount: '0.02', to: 'sol',
+    }),
+    /unsupported destination/,
+  )
+  await assert.rejects(
+    () => createQuoteService({ config, fetchImpl, blockhash: stubBlockhash }).getQuote({
+      from: 'eth', amount: '0.02', toNetwork: 'ethereum',
+    }),
+    /unsupported destination/,
+  )
+  assert.equal(fetchImpl.calls.length, 0, 'must not reach Relay when the destination is wrong')
+})
+
+test('a price-only quote (no user) carries no tx, steps or solanaTx, and is marked executable:false', async () => {
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
+  const q = await svc.getQuote({ from: 'eth', amount: '0.02' })
+
+  assert.equal(q.tx, undefined)
+  assert.equal(q.steps, undefined)
+  assert.equal(q.solanaTx, undefined)
+  assert.equal(q.executable, false)
+  // Still a real price — the safety gate must not degrade the quote itself.
+  assert.ok(q.amountOut > 0)
+})
+
+test('a price-only Solana quote (no user) also omits solanaTx and never fetches a blockhash', async () => {
+  let blockhashCalled = false
+  const neverCalled = {
+    get: async () => {
+      blockhashCalled = true
+      throw new Error('blockhash.get() must not be called for a price-only quote')
+    },
+  }
+  const svc = createQuoteService({
+    config: solanaTestConfig(),
+    fetchImpl: stubFetch([['/quote', async () => RELAY_SOLANA_QUOTE]]),
+    blockhash: neverCalled,
+  })
+  const q = await svc.getQuote({ from: 'sol', amount: '0.25' })
+
+  assert.equal(blockhashCalled, false, 'a price-only quote must not fetch a blockhash')
+  assert.equal(q.solanaTx, undefined)
+  assert.equal(q.tx, undefined)
+  assert.equal(q.steps, undefined)
+  assert.equal(q.executable, false)
+  assert.equal(q.vm, 'svm', 'vm must still be reported even without a signable payload')
+})
+
+test('when user IS supplied via the from shape, the quote is executable and carries tx as usual (EVM)', async () => {
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
+  const q = await svc.getQuote({ from: 'eth', amount: '0.02', user: USER })
+
+  assert.equal(q.executable, true)
+  assert.ok(q.tx, 'a quote with a real user must still carry a signable tx')
+  assert.equal(q.tx.from, USER)
+})
+
+test('when user IS supplied via the from shape, the quote is executable and carries solanaTx as usual (Solana)', async () => {
+  const svc = createQuoteService({
+    config: solanaTestConfig(),
+    fetchImpl: stubFetch([['/quote', async () => RELAY_SOLANA_QUOTE]]),
+    blockhash: stubBlockhash,
+  })
+  const q = await svc.getQuote({
+    from: 'sol', amount: '0.25', user: SOL_PAYER, recipient: EVM_RECIPIENT,
+  })
+
+  assert.equal(q.executable, true)
+  assert.ok(q.solanaTx, 'a quote with a real payer must still carry a signable solanaTx')
+})
+
+test('etaSeconds mirrors timeEstimate — the field the widget actually reads', async () => {
+  // The widget renders `etaSeconds ?? estimatedTime`; the old field name
+  // (timeEstimate) is not in that list, so before this fix its ETA rendered
+  // as a dash regardless of what Relay reported.
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
+  const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
+  assert.equal(q.etaSeconds, q.timeEstimate)
+  assert.equal(q.etaSeconds, 3)
+})
+
+test('crossChain is true for an ordinary origin and false only when the origin is already Robinhood Chain (4663)', async () => {
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
+  const crossChainQuote = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
+  assert.equal(crossChainQuote.crossChain, true)
+
+  const sameChainQuote = await svc.getQuote({ user: USER, chainId: 4663, amount: '0.02' })
+  assert.equal(sameChainQuote.crossChain, false)
+})
+
+test('slippage echoes back what was requested, and defaults to 1 when absent', async () => {
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
+  const withSlippage = await svc.getQuote({ from: 'eth', amount: '0.02', slippage: '2.5' })
+  assert.equal(withSlippage.slippage, 2.5)
+
+  const withoutSlippage = await svc.getQuote({ from: 'eth', amount: '0.02' })
+  assert.equal(withoutSlippage.slippage, 1)
+})
+
+test('the swap widget\'s literal request shape prices out end-to-end', async () => {
+  // GET /quote?amount=40&from=usdc-eth&fromNetwork=ethereum&to=ponsy&toNetwork=ponsy&slippage=1
+  // (fromNetwork is accepted and ignored — the asset key alone determines
+  // the chain, per resolvePayAssetKey).
+  const svc = createQuoteService({
+    config,
+    fetchImpl: stubFetch([['/quote', async () => RELAY_APPROVE_QUOTE]]),
+    blockhash: stubBlockhash,
+  })
+  const q = await svc.getQuote({
+    amount: '40', from: 'usdc-eth', fromNetwork: 'ethereum', to: 'ponsy', toNetwork: 'ponsy', slippage: '1',
+  })
+  assert.equal(q.executable, false)
+  assert.equal(q.slippage, 1)
+  assert.equal(q.crossChain, true)
+  assert.ok(q.amountOut > 0)
+  assert.equal(q.tx, undefined)
+  assert.equal(q.steps, undefined)
+})
+
+/* ---------------------------------------------------------------------------
+   THE EXISTING SHAPE MUST STAY BYTE-IDENTICAL
+
+   Everything below pins the (chainId, token, user, recipient) shape's
+   response exactly as the deployed frontend already relies on it — new
+   fields are additive (see above), but nothing here may be renamed, removed,
+   or change value for a request shaped exactly like the one in production.
+--------------------------------------------------------------------------- */
+
+test('the existing request shape returns every field the deployed frontend reads, unchanged', async () => {
+  const svc = createQuoteService({ config, fetchImpl: ok(), blockhash: stubBlockhash })
+  const q = await svc.getQuote({ user: USER, chainId: 8453, amount: '0.02' })
+
+  assert.equal(q.amountIn, 0.02)
+  assert.equal(q.amountInUsd, 38.427738)
+  assert.ok(Math.abs(q.amountOut - 287080.5756130577) < 0.001)
+  assert.equal(q.amountOutUsd, 36.462148)
+  assert.ok(Math.abs(q.rate - 14354028.780652884) < 0.001)
+  assert.ok(Math.abs(q.priceImpact - -0.0512) < 1e-9)
+  assert.ok(Math.abs(q.minReceived - 281338.9641007965) < 0.001)
+  assert.equal(q.feeUsd, 0.730005)
+  assert.equal(q.timeEstimate, 3)
+  assert.equal(q.route, 'Base to Robinhood Chain, one transaction')
+  assert.equal(q.token.symbol, 'ETH')
+  assert.equal(q.vm, 'evm')
+  assert.match(q.requestId, /^0x/)
+  assert.equal(q.mock, false)
+  assert.deepEqual(q.tx, {
+    from: '0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E',
+    to: '0x4cd00e387622c35bddb9b4c962c136462338bc31',
+    data: '0x49290c1c0000000000000000000000002dfec17b1d8dce43cb5b1111352fd58be01d389e',
+    value: '20000000000000000',
+    chainId: 8453,
+    gas: 32713,
+  })
+  // New, additive fields — present, but not a rename of anything above.
+  assert.equal(q.executable, true)
+  assert.equal(q.etaSeconds, 3)
+  assert.equal(q.crossChain, true)
+  assert.equal(q.slippage, 1)
+})

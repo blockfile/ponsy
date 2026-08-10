@@ -12,7 +12,7 @@
 
 import { fetchRelayQuote, fetchRelayStatus } from './sources/relay.js'
 import { buildSolanaTransaction } from './chain/solana.js'
-import { resolveToken } from './tokens.js'
+import { resolveToken, resolvePayAssetKey } from './tokens.js'
 
 const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/
 
@@ -20,6 +20,24 @@ const ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/
     the PONSY it receives. Not an origin-currency identifier — those now come
     from tokens.js's resolveToken(). */
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
+
+/**
+ * Placeholder addresses used ONLY to price a quote when nobody has connected
+ * a wallet — a request with no `user` (see `priceOnly` in getQuote below).
+ * Relay's pricing call still needs a syntactically valid `user` and, for a
+ * Solana origin, a syntactically valid EVM `recipient`, to price against —
+ * but nothing downstream may ever build a SIGNABLE transaction around either
+ * one. Safe for pricing: neither address has a private key anyone controls
+ * (the EVM one is the conventional unspendable "dead" address; the Solana
+ * one is the System Program's all-zero-byte key), so a quote priced against
+ * them commits nobody to anything. Unsafe for signing: a real transaction
+ * addressed to or from a placeholder would move a real user's PONSY to an
+ * account nobody can ever recover it from — which is exactly why getQuote()
+ * omits tx/steps/solanaTx entirely, rather than merely building them around
+ * these, whenever priceOnly is true.
+ */
+const PRICE_ONLY_ADDRESS_EVM = '0x' + 'dead'.repeat(10)
+const PRICE_ONLY_ADDRESS_SVM = '11111111111111111111111111111111'
 
 /** Relay's id for Solana. Verified live. Still drives VM branching even
     though the currency itself is resolved via tokens.js. */
@@ -68,6 +86,17 @@ const num = (v) => {
   return Number.isFinite(n) ? n : 0
 }
 
+/** Requested slippage tolerance -> a finite number, defaulting to 1 (matches
+    the widget's own DEFAULT_SLIPPAGE) for anything missing or unusable.
+    Deliberately not `num()`, which defaults to 0 — 0% slippage tolerance is
+    a real, much stricter setting than "not specified", so the two must not
+    collapse into the same value. */
+function parseSlippage(value) {
+  if (value === undefined || value === null || value === '') return 1
+  const n = Number(value)
+  return Number.isFinite(n) ? n : 1
+}
+
 /**
  * Parses Relay's gas LIMIT into a definite JS number, or undefined if
  * absent/unusable — never 0, never a string.
@@ -100,10 +129,39 @@ export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
     throw new Error('createQuoteService requires a blockhash provider with a get() method')
   }
 
-  async function getQuote({ user, chainId, amount, recipient, token, signal }) {
+  async function getQuote({
+    user, chainId, amount, recipient, token, signal,
+    // New, additive request shape — see tokens.js's resolvePayAssetKey.
+    // Never read unless `from` is present, so a caller using the existing
+    // (chainId, token, user, recipient) shape is completely unaffected by
+    // any of these three.
+    from, to, toNetwork, slippage,
+  }) {
     if (!config.tokenAddress) {
       throw new Error('TOKEN_ADDRESS is not set')
     }
+
+    /* Detected by the presence of `from`, per the swap widget's contract:
+       it names an asset by key ("usdc-eth") instead of a chain id and a
+       token key. Resolved into `chainId`/`token` and then handled by every
+       line below exactly as the existing shape already is — this is the
+       only place the two request shapes diverge. */
+    if (from !== undefined && from !== null && from !== '') {
+      /* The destination is fixed server-side (config.tokenAddress, chain
+         4663 below) and never actually read from `to`/`toNetwork` — but a
+         caller sending one that ISN'T "ponsy" has a bug worth surfacing
+         rather than silently quoting PONSY anyway. */
+      if (to !== undefined && to !== '' && to !== 'ponsy') {
+        throw new Error(`unsupported destination "${to}" — this endpoint only quotes PONSY`)
+      }
+      if (toNetwork !== undefined && toNetwork !== '' && toNetwork !== 'ponsy') {
+        throw new Error(`unsupported destination network "${toNetwork}" — this endpoint only quotes PONSY`)
+      }
+      const resolved = resolvePayAssetKey(String(from))
+      chainId = resolved.chainId
+      token = resolved.token
+    }
+
     const origin = Number(chainId)
     if (!config.allowedChainIds.includes(origin)) {
       throw new Error(`chain ${chainId} is not supported`)
@@ -115,44 +173,62 @@ export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
        request. See src/tokens.js for why. */
     const originToken = resolveToken(origin, token ?? 'native')
 
-    if (isSolana) {
-      if (!BASE58_RE.test(String(user ?? ''))) {
-        throw new Error('user must be a base58 Solana address for a Solana origin')
-      }
-      /* A Solana keypair has no EVM address, so the destination cannot be
-         derived — it has to be supplied. Guessing one would send PONSY
-         somewhere unrecoverable. */
-      if (!ADDRESS_RE.test(String(recipient ?? ''))) {
-        throw new Error('recipient must be a 0x address when paying from Solana')
-      }
-      /* The zero address is a syntactically valid 0x string, so the check
-         above alone lets it through. On EVM this was never reachable — the
-         recipient there is always the connected wallet — but a Solana
-         recipient is a free-form field, so a frontend bug or a crafted link
-         can produce a signable transaction that delivers PONSY to a burn
-         address. */
-      if (String(recipient).toLowerCase() === ZERO_ADDRESS) {
-        throw new Error('recipient must not be the zero address — that PONSY would be unrecoverable')
-      }
-    } else if (!ADDRESS_RE.test(String(user ?? ''))) {
-      throw new Error('user must be a 0x-prefixed 40-hex-character address')
-    }
+    /* No `user` at all means a price-only quote — the swap widget's new
+       shape never sends one, but the existing shape is equally entitled to
+       omit it and get a price rather than a validation error. Everything
+       from here on that would produce something SIGNABLE (the blockhash
+       fetch below, and the tx/steps/solanaTx assembly further down) is
+       gated on this being false. See PRICE_ONLY_ADDRESS_EVM/SVM above for
+       why a placeholder is safe for this and only this. */
+    const priceOnly = user === undefined || user === null || user === ''
 
-    /* Re-stringified rather than forwarded as-is: Express turns
-       `?user[0]=...` into a one-element array, and String() of a
-       one-element array equals its bare element — so the ADDRESS_RE/
-       BASE58_RE checks above can pass while `user`/`recipient` are still
-       arrays, not strings. Letting that array reach the Relay request body,
-       or buildSolanaTransaction's feePayer below, is the actual hazard:
-       `new PublicKey(['abc...'])` does not throw, it silently yields the
-       all-zeros system-program key (verified directly against
-       @solana/web3.js) — caught in this codebase's own tests only by
-       incidental luck, because that bogus key happens not to be declared a
-       signer in the captured fixture's instructions. A plain string is the
-       one thing every downstream consumer must receive. */
-    const payer = String(user)
-    /* On EVM the payer receives, exactly as before. */
-    const receiver = isSolana ? String(recipient) : payer
+    let payer
+    let receiver
+    if (priceOnly) {
+      payer = isSolana ? PRICE_ONLY_ADDRESS_SVM : PRICE_ONLY_ADDRESS_EVM
+      /* A Solana quote's destination is an EVM address; an EVM quote's
+         payer receives directly — same shape as the real branch below. */
+      receiver = isSolana ? PRICE_ONLY_ADDRESS_EVM : payer
+    } else {
+      if (isSolana) {
+        if (!BASE58_RE.test(String(user ?? ''))) {
+          throw new Error('user must be a base58 Solana address for a Solana origin')
+        }
+        /* A Solana keypair has no EVM address, so the destination cannot be
+           derived — it has to be supplied. Guessing one would send PONSY
+           somewhere unrecoverable. */
+        if (!ADDRESS_RE.test(String(recipient ?? ''))) {
+          throw new Error('recipient must be a 0x address when paying from Solana')
+        }
+        /* The zero address is a syntactically valid 0x string, so the check
+           above alone lets it through. On EVM this was never reachable — the
+           recipient there is always the connected wallet — but a Solana
+           recipient is a free-form field, so a frontend bug or a crafted link
+           can produce a signable transaction that delivers PONSY to a burn
+           address. */
+        if (String(recipient).toLowerCase() === ZERO_ADDRESS) {
+          throw new Error('recipient must not be the zero address — that PONSY would be unrecoverable')
+        }
+      } else if (!ADDRESS_RE.test(String(user ?? ''))) {
+        throw new Error('user must be a 0x-prefixed 40-hex-character address')
+      }
+
+      /* Re-stringified rather than forwarded as-is: Express turns
+         `?user[0]=...` into a one-element array, and String() of a
+         one-element array equals its bare element — so the ADDRESS_RE/
+         BASE58_RE checks above can pass while `user`/`recipient` are still
+         arrays, not strings. Letting that array reach the Relay request body,
+         or buildSolanaTransaction's feePayer below, is the actual hazard:
+         `new PublicKey(['abc...'])` does not throw, it silently yields the
+         all-zeros system-program key (verified directly against
+         @solana/web3.js) — caught in this codebase's own tests only by
+         incidental luck, because that bogus key happens not to be declared a
+         signer in the captured fixture's instructions. A plain string is the
+         one thing every downstream consumer must receive. */
+      payer = String(user)
+      /* On EVM the payer receives, exactly as before. */
+      receiver = isSolana ? String(recipient) : payer
+    }
 
     /* Started here — before the Relay round trip — and awaited only where
        the value is actually used, inside the `isSolana` branch below. The
@@ -180,8 +256,13 @@ export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
        a no-op handler the instant the promise is created absorbs that
        specific hazard without hiding a real failure: `await pendingBlockhash`
        below still throws normally on its own rejection, for whichever
-       request actually reaches it. */
-    const pendingBlockhash = isSolana ? blockhash.get({ signal }) : null
+       request actually reaches it.
+
+       Gated on !priceOnly too: a blockhash exists to make a transaction
+       signable, and a price-only quote will never build one (see the
+       isSolana branch of the tx-assembly block below) — fetching it anyway
+       would be a wasted Solana RPC call on every price-only request. */
+    const pendingBlockhash = isSolana && !priceOnly ? blockhash.get({ signal }) : null
     pendingBlockhash?.catch(() => {})
 
     const raw = await fetchRelayQuote(
@@ -232,8 +313,15 @@ export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
        instruction list, the other calldata — so exactly one of solanaTx/tx is
        built here and spread into the response below. Never both, never
        neither: a frontend that hasn't been updated for the other VM must fail
-       loudly on an undefined field rather than sign something meaningless. */
-    let txField
+       loudly on an undefined field rather than sign something meaningless.
+
+       A price-only quote (priceOnly true) builds NEITHER: txField stays `{}`
+       and nothing below it is spread into the response, so amountOut /
+       priceImpact / etc. still price out normally, but there is no
+       signable payload for a placeholder-addressed request to be attached
+       to. This is the one gate this whole feature exists to get right — see
+       PRICE_ONLY_ADDRESS_EVM/SVM's comment at the top of this file. */
+    let txField = {}
     /* How many signatures this quote actually requires, hoisted out of the
        branch below so the shared `route` string can reflect it. A Solana
        quote is always exactly one blob to sign; an EVM quote may be one
@@ -244,68 +332,72 @@ export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
       if (!Array.isArray(ixs) || ixs.length === 0) {
         throw new Error('Relay returned no Solana instructions to sign')
       }
-      const { blockhash: hash, lastValidBlockHeight } = await pendingBlockhash
-      txField = {
-        solanaTx: {
-          base64: buildSolanaTransaction({
-            instructions: ixs,
-            feePayer: payer,
-            blockhash: hash,
-          }),
-          lastValidBlockHeight,
-        },
-      }
       stepCount = 1
+      if (!priceOnly) {
+        const { blockhash: hash, lastValidBlockHeight } = await pendingBlockhash
+        txField = {
+          solanaTx: {
+            base64: buildSolanaTransaction({
+              instructions: ixs,
+              feePayer: payer,
+              blockhash: hash,
+            }),
+            lastValidBlockHeight,
+          },
+        }
+      }
     } else {
       const rawSteps = raw?.steps ?? []
       if (rawSteps.length === 0) throw new Error('Relay returned no steps to sign')
+      stepCount = rawSteps.length
 
-      /* Every step is validated the same way the old single-transaction path
-         validated its one step — `to` and `from` must both be present — but
-         now for EACH step, with the step id in the message. A two-step quote
-         (approve, deposit) whose approval is well-formed but whose deposit is
-         missing `to` must fail on the deposit specifically, not pass because
-         only steps[0] was ever checked. */
-      const steps = rawSteps.map((s) => {
-        const d = s?.items?.[0]?.data
-        if (!d?.to) throw new Error(`Relay step "${s?.id}" has no transaction to sign`)
-        /* `from` is forwarded to the frontend and relied on by two independent
-           downstream guards: the wallet only gets to validate its selected
-           account against a `from` that actually exists on `tx`, and the
-           frontend's own account-match check (`if (from && ...)`) skips
-           entirely when `from` is absent — silently, not fail-closed. Refuse
-           here rather than let a Relay response with no `from` defeat both. */
-        if (!d?.from) throw new Error(`Relay step "${s?.id}" has no sending account`)
-        const gasLimit = parseGasLimit(d.gas)
-        return {
-          id: s.id,
-          tx: {
-            /* Carried through because some wallets reject eth_sendTransaction
-               without an explicit `from`. Relay echoes back the `user` we sent, so
-               this is the connected account by construction. */
-            from: d.from,
-            to: d.to,
-            data: d.data,
-            value: String(d.value ?? '0'),
-            chainId: d.chainId,
-            /* Gas LIMIT, forwarded as a genuine JS number (see parseGasLimit) —
-               never stringified, never hex-encoded, and never a stale
-               maxFeePerGas/maxPriorityFeePerGas (those are prices, not limits,
-               and go stale between quote and send — see prior revisions of this
-               file for the full incident writeup). Omitted entirely, never
-               null/0, when Relay doesn't supply a usable one, so the wallet
-               falls back to its own estimation. */
-            ...(gasLimit !== undefined ? { gas: gasLimit } : {}),
-          },
-        }
-      })
+      if (!priceOnly) {
+        /* Every step is validated the same way the old single-transaction path
+           validated its one step — `to` and `from` must both be present — but
+           now for EACH step, with the step id in the message. A two-step quote
+           (approve, deposit) whose approval is well-formed but whose deposit is
+           missing `to` must fail on the deposit specifically, not pass because
+           only steps[0] was ever checked. */
+        const steps = rawSteps.map((s) => {
+          const d = s?.items?.[0]?.data
+          if (!d?.to) throw new Error(`Relay step "${s?.id}" has no transaction to sign`)
+          /* `from` is forwarded to the frontend and relied on by two independent
+             downstream guards: the wallet only gets to validate its selected
+             account against a `from` that actually exists on `tx`, and the
+             frontend's own account-match check (`if (from && ...)`) skips
+             entirely when `from` is absent — silently, not fail-closed. Refuse
+             here rather than let a Relay response with no `from` defeat both. */
+          if (!d?.from) throw new Error(`Relay step "${s?.id}" has no sending account`)
+          const gasLimit = parseGasLimit(d.gas)
+          return {
+            id: s.id,
+            tx: {
+              /* Carried through because some wallets reject eth_sendTransaction
+                 without an explicit `from`. Relay echoes back the `user` we sent, so
+                 this is the connected account by construction. */
+              from: d.from,
+              to: d.to,
+              data: d.data,
+              value: String(d.value ?? '0'),
+              chainId: d.chainId,
+              /* Gas LIMIT, forwarded as a genuine JS number (see parseGasLimit) —
+                 never stringified, never hex-encoded, and never a stale
+                 maxFeePerGas/maxPriorityFeePerGas (those are prices, not limits,
+                 and go stale between quote and send — see prior revisions of this
+                 file for the full incident writeup). Omitted entirely, never
+                 null/0, when Relay doesn't supply a usable one, so the wallet
+                 falls back to its own estimation. */
+              ...(gasLimit !== undefined ? { gas: gasLimit } : {}),
+            },
+          }
+        })
 
-      /* `tx` is retained for single-step quotes so a client that predates the
-         steps array keeps working. A multi-step quote deliberately omits it:
-         such a client must fail loudly rather than sign the approval and stop,
-         leaving the user having paid gas for nothing. */
-      txField = steps.length === 1 ? { steps, tx: steps[0].tx } : { steps }
-      stepCount = steps.length
+        /* `tx` is retained for single-step quotes so a client that predates the
+           steps array keeps working. A multi-step quote deliberately omits it:
+           such a client must fail loudly rather than sign the approval and stop,
+           leaving the user having paid gas for nothing. */
+        txField = steps.length === 1 ? { steps, tx: steps[0].tx } : { steps }
+      }
     }
 
     return {
@@ -330,6 +422,27 @@ export function createQuoteService({ config, fetchImpl = fetch, blockhash }) {
          displays separately. Adding it here would double-count it. */
       feeUsd: num(raw?.fees?.relayer?.amountUsd) + num(raw?.fees?.app?.amountUsd),
       timeEstimate: num(d.timeEstimate),
+      /* Same value as timeEstimate above, under the name the swap widget
+         actually reads: it renders `etaSeconds ?? estimatedTime`, and
+         neither of those was ever sent, so its ETA rendered as a dash. Kept
+         as a second field rather than a rename — `timeEstimate` already
+         serves the other, deployed frontend and must not move. */
+      etaSeconds: num(d.timeEstimate),
+      /* True unless the ORIGIN is already Robinhood Chain (4663) — the
+         destination this endpoint always quotes to. Paying from 4663 is the
+         one case that is not actually a cross-chain swap. */
+      crossChain: origin !== 4663,
+      // Echoes back what was requested, defaulting to 1 exactly like the
+      // widget's own DEFAULT_SLIPPAGE — this layer doesn't currently use
+      // the value for anything (Relay isn't told a slippage tolerance), so
+      // echoing is honest: it reflects the request, not a promise enforced
+      // upstream.
+      slippage: parseSlippage(slippage),
+      /* False for a price-only quote (see `priceOnly` above): tx/steps/
+         solanaTx are deliberately absent from `txField` in that case, and
+         this is the positive, always-present flag an executor can check
+         instead of inferring "can I sign this?" from field absence. */
+      executable: !priceOnly,
       /* Reflects the real signature count. A hardcoded "one transaction" here
          lied on a two-step (approve + deposit) quote — exactly the live USDC
          capture in this task's report — telling the user to expect one

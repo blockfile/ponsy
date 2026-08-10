@@ -476,6 +476,96 @@ test('GET /quote returns 400 when the service rejects a Solana quote for a missi
   )
 })
 
+test('GET /quote forwards from/to/toNetwork/slippage from the query string verbatim', async () => {
+  // Mirrors the recipient/token forwarding tests above — the same class of
+  // bug (dropped at the HTTP layer) would leave every unit test that calls
+  // getQuote() directly green while ?from=usdc-eth silently fell through to
+  // the old (chainId, token) shape and quoted the wrong asset.
+  let received
+  await withServer(
+    {
+      config: CONFIG,
+      collect: async () => PAYLOAD,
+      quoteService: quoteStub({
+        getQuote: async (args) => {
+          received = args
+          return QUOTE
+        },
+      }),
+      cacheTtlMs: 0,
+      staleMaxMs: 0,
+    },
+    async (get) => {
+      // The literal shape Meme4's src/lib/swap.js builds.
+      const res = await get(
+        '/quote?amount=40&from=usdc-eth&fromNetwork=ethereum&to=ponsy&toNetwork=ponsy&slippage=1',
+      )
+      assert.equal(res.status, 200)
+      assert.equal(received.from, 'usdc-eth')
+      assert.equal(received.to, 'ponsy')
+      assert.equal(received.toNetwork, 'ponsy')
+      assert.equal(received.slippage, '1')
+      assert.equal(received.user, undefined, 'the new shape sends no user')
+    },
+  )
+})
+
+test('GET /quote still forwards the existing shape untouched when `from` is absent', async () => {
+  // Pins that adding the new params to the route handler did not perturb
+  // the existing forwarding — same assertion style as the recipient/token
+  // tests above, now covering the whole existing param set at once.
+  let received
+  await withServer(
+    {
+      config: CONFIG,
+      collect: async () => PAYLOAD,
+      quoteService: quoteStub({
+        getQuote: async (args) => {
+          received = args
+          return QUOTE
+        },
+      }),
+      cacheTtlMs: 0,
+      staleMaxMs: 0,
+    },
+    async (get) => {
+      const res = await get(
+        '/quote?amount=0.02&chainId=8453&user=0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E&token=usdc',
+      )
+      assert.equal(res.status, 200)
+      assert.equal(received.chainId, '8453')
+      assert.equal(received.user, '0x2DFeC17b1d8DcE43cB5B1111352Fd58BE01d389E')
+      assert.equal(received.token, 'usdc')
+      assert.equal(received.from, undefined)
+    },
+  )
+})
+
+test('GET /quote returns 400 with the actionable message when the service refuses usdc-sol', async () => {
+  // End-to-end through the HTTP layer, not just quote.js directly — proves
+  // the friendly message (not a raw Relay error code or a stack trace)
+  // actually reaches an HTTP caller.
+  await withServer(
+    {
+      config: CONFIG,
+      collect: async () => PAYLOAD,
+      quoteService: quoteStub({
+        getQuote: async () => {
+          throw new Error('USDC on Solana cannot be swapped to PONSY yet. Try SOL.')
+        },
+      }),
+      cacheTtlMs: 0,
+      staleMaxMs: 0,
+    },
+    async (get) => {
+      const res = await get('/quote?amount=10&from=usdc-sol&to=ponsy&toNetwork=ponsy')
+      const body = await res.json()
+      assert.equal(res.status, 400)
+      assert.match(body.error, /USDC on Solana cannot be swapped to PONSY yet\. Try SOL\./)
+    },
+  )
+})
+
 test('GET /quote/status proxies the intent status', async () => {
   /* The route must forward req.query.requestId to the service untouched —
      a regression that dropped it (eg. forwarding undefined) would otherwise

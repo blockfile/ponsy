@@ -243,6 +243,17 @@ export function createServer({ config, statsService, quoteService, cache, logger
           amount: req.query.amount,
           recipient: req.query.recipient,
           token: req.query.token,
+          /* The new, additive shape the swap UI sends — see quote.js's
+             getQuote for how `from` is resolved and why `to`/`toNetwork`
+             are validated rather than used. Forwarding these unconditionally
+             is exactly as safe as forwarding `token` always was: quote.js
+             ignores all four unless `from` is actually present, so a caller
+             using the existing (chainId, token, user, recipient) shape sends
+             them as undefined and nothing about its handling changes. */
+          from: req.query.from,
+          to: req.query.to,
+          toNetwork: req.query.toNetwork,
+          slippage: req.query.slippage,
         }),
         config.quoteWaitMs,
         () => new QuoteTimeoutError(`quote exceeded the ${config.quoteWaitMs}ms wait budget`),

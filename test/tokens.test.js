@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { resolveToken, tokensFor, TOKENS_BY_CHAIN } from '../src/tokens.js'
+import { resolveToken, tokensFor, TOKENS_BY_CHAIN, resolvePayAssetKey } from '../src/tokens.js'
 
 const NATIVE = '0x0000000000000000000000000000000000000000'
 
@@ -52,6 +52,40 @@ test('a caller cannot inject an address — only keys are accepted', () => {
     () => resolveToken(8453, '0xd314ee5350570e57c8e2e5bb6b3920cd1a16083e'),
     /not available/,
   )
+})
+
+/* resolvePayAssetKey — the swap widget's `?from=` key -> (chainId, token)
+   mapping. Every row here is the table verified live against Relay
+   (2026-08-09) in the task that added this endpoint shape. */
+
+test('maps each pay-asset key to the chain and token it was verified against', () => {
+  assert.deepEqual(resolvePayAssetKey('sol'), { chainId: 792703809, token: 'native' })
+  assert.deepEqual(resolvePayAssetKey('bnb'), { chainId: 56, token: 'native' })
+  assert.deepEqual(resolvePayAssetKey('eth'), { chainId: 1, token: 'native' })
+  assert.deepEqual(resolvePayAssetKey('usdc-eth'), { chainId: 1, token: 'usdc' })
+})
+
+test('every resolvePayAssetKey mapping resolves through resolveToken too', () => {
+  // Pins the two files together: a mapping that points at a (chainId, token)
+  // pair tokens.js doesn't actually offer would throw deep inside quote.js
+  // instead of here, where the mismatch is obvious.
+  for (const key of ['sol', 'bnb', 'eth', 'usdc-eth']) {
+    const { chainId, token } = resolvePayAssetKey(key)
+    assert.doesNotThrow(() => resolveToken(chainId, token), key)
+  }
+})
+
+test('rejects usdc-sol with an actionable message naming the real problem, not a generic refusal', () => {
+  // SPL USDC genuinely has no route to PONSY (NO_SWAP_ROUTES_FOUND, verified
+  // live) — this must read as "this asset doesn't work here", not as one
+  // more instance of the generic unknown-key error below.
+  assert.throws(() => resolvePayAssetKey('usdc-sol'), /USDC on Solana cannot be swapped to PONSY/)
+})
+
+test('rejects an unknown pay-asset key rather than defaulting to any asset', () => {
+  assert.throws(() => resolvePayAssetKey('doge'), /not a supported asset/)
+  assert.throws(() => resolvePayAssetKey(''), /not a supported asset/)
+  assert.throws(() => resolvePayAssetKey(undefined), /not a supported asset/)
 })
 
 test('every listed address is a plausible identifier for its VM', () => {

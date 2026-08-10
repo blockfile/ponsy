@@ -84,3 +84,49 @@ export function resolveToken(chainId, key) {
   }
   return found
 }
+
+/**
+ * PAY-ASSET KEYS
+ * -----------------------------------------------------------------------------
+ * Maps the swap widget's asset key (eg. "usdc-eth", from `?from=usdc-eth`)
+ * onto the (chainId, token key) pair the rest of this file already
+ * understands. This is the boundary for the price-only `/quote?from=...`
+ * request shape: the widget names an asset by key, never by chain id or
+ * address, and an unrecognised key must be refused HERE — before any request
+ * reaches Relay — with a message a visitor can act on, not a raw upstream
+ * error code or a stack trace.
+ *
+ * Every mapping below was verified live against Relay on 2026-08-09.
+ */
+const PAY_ASSET_KEYS = {
+  sol: { chainId: 792703809, token: 'native' },
+  bnb: { chainId: 56, token: 'native' },
+  eth: { chainId: 1, token: 'native' },
+  'usdc-eth': { chainId: 1, token: 'usdc' },
+}
+
+/**
+ * Resolves a pay-asset key to the chain and token it prices against.
+ *
+ * `usdc-sol` gets its own message rather than falling into the generic
+ * "unsupported key" branch: SPL USDC genuinely has no route to PONSY today
+ * (Relay returns NO_SWAP_ROUTES_FOUND for every destination we tried), which
+ * is a fact about the market, not a bug in this list — a visitor deserves to
+ * be told that, and told what to try instead, rather than reading "usdc-sol
+ * is not a supported asset" as if it were simply unimplemented.
+ *
+ * Never defaults to native or to any other asset: quoting a different asset
+ * than the one the caller named is how someone gets priced in the wrong
+ * currency.
+ */
+export function resolvePayAssetKey(key) {
+  if (key === 'usdc-sol') {
+    throw new Error('USDC on Solana cannot be swapped to PONSY yet. Try SOL.')
+  }
+  const found = PAY_ASSET_KEYS[key]
+  if (!found) {
+    const offered = Object.keys(PAY_ASSET_KEYS).join(', ')
+    throw new Error(`"${key}" is not a supported asset yet (supported: ${offered}).`)
+  }
+  return found
+}
