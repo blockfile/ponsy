@@ -1,7 +1,14 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 
-import { word, decodeUint, decodeUint8, decodeAddress } from '../src/chain/abi.js'
+import {
+  SELECTORS,
+  word,
+  decodeUint,
+  decodeUint8,
+  decodeAddress,
+  encodeBalanceOf,
+} from '../src/chain/abi.js'
 import {
   SLOT0_RETURNDATA,
   SQRT_PRICE_X96,
@@ -51,4 +58,39 @@ test('rejects a uint8 that does not fit in a byte', () => {
 
 test('accepts returndata without the 0x prefix', () => {
   assert.equal(decodeUint8(DECIMALS_18_RETURNDATA.slice(2)), 18)
+})
+
+test('encodeBalanceOf produces exactly 4 + 32 bytes with the address right-aligned', () => {
+  const address = '0xAbCdEf0123456789aBcDef0123456789ABCDEF01'
+  const calldata = encodeBalanceOf(address)
+
+  assert.equal(
+    calldata.slice(0, 10),
+    SELECTORS.balanceOf,
+    'the first 4 bytes are the balanceOf selector',
+  )
+  assert.equal(
+    calldata.length,
+    2 + 8 + 64,
+    '0x + 4-byte selector + one 32-byte word, no more and no less',
+  )
+  assert.equal(
+    calldata.slice(10, 34),
+    '0'.repeat(24),
+    'the word\'s upper 12 bytes are zero padding',
+  )
+  assert.equal(
+    calldata.slice(34),
+    address.slice(2).toLowerCase(),
+    'the address occupies the low 20 bytes of the word, right-aligned',
+  )
+})
+
+test('encodeBalanceOf lowercases the address', () => {
+  /* The padding is positional, not checksum-sensitive — a mixed-case tail
+     would still decode identically on-chain, but comparing calldata strings
+     in tests (and logs) is easier when case is normalised. */
+  const upper = '0x' + 'AB'.repeat(20)
+  const lower = '0x' + 'ab'.repeat(20)
+  assert.equal(encodeBalanceOf(upper), encodeBalanceOf(lower))
 })

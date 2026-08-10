@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 
 import { buildConfig } from '../src/config.js'
 import { createStatsService } from '../src/stats.js'
-import { SELECTORS } from '../src/chain/abi.js'
+import { SELECTORS, encodeBalanceOf } from '../src/chain/abi.js'
 import {
   TOKEN_ADDRESS,
   POOL_ADDRESS,
@@ -13,11 +13,19 @@ import {
   TOKEN1_RETURNDATA,
   TOTAL_SUPPLY_RETURNDATA,
   DECIMALS_18_RETURNDATA,
+  DEAD_ADDRESS,
+  ZERO_ADDRESS,
+  DEAD_BALANCE_RETURNDATA,
+  ZERO_BALANCE_RETURNDATA,
   BLOCKSCOUT_COUNTERS,
   BLOCKSCOUT_STATS,
   DEXSCREENER_TOKENS,
   stubFetch,
 } from './fixtures.js'
+
+/** The exact calldata readChain sends for the two burn reads. */
+const DEAD_CALL_DATA = encodeBalanceOf(DEAD_ADDRESS)
+const ZERO_CALL_DATA = encodeBalanceOf(ZERO_ADDRESS)
 
 /** Live figures at the captured block, for asserting against. */
 const ETH_USD = 1919.5
@@ -50,6 +58,8 @@ function stubRpc({ fail = null, overrides = {} } = {}) {
         }
         if (data === SELECTORS.totalSupply) return TOTAL_SUPPLY_RETURNDATA
         if (data === SELECTORS.decimals) return DECIMALS_18_RETURNDATA
+        if (data === DEAD_CALL_DATA) return DEAD_BALANCE_RETURNDATA
+        if (data === ZERO_CALL_DATA) return ZERO_BALANCE_RETURNDATA
         if (data === SELECTORS.slot0) return SLOT0_RETURNDATA
         if (data === SELECTORS.token0) return TOKEN0_RETURNDATA
         if (data === SELECTORS.token1) return TOKEN1_RETURNDATA
@@ -81,6 +91,137 @@ test('prices from the pool when everything is healthy', async () => {
   assert.ok(Math.abs(stats.marketCap - EXPECTED_MCAP) < 0.01)
   assert.equal(stats.placeholder, false)
   assert.deepEqual(stats.warnings, [])
+
+  /* Verified on-chain 2026-08-10 (see the design doc): balanceOf(dead) =
+     30,436,764, decimals applied, against a 1B totalSupply. */
+  assert.equal(stats.burned, 30_436_764)
+  assert.ok(Math.abs(stats.burnedPct - 3.0436764) < 1e-6)
+})
+
+test('sends the burn reads in the SAME ethCallBatch call as totalSupply, not a second one', async () => {
+  /* This is the constraint the whole feature exists for. This project's 504
+     outage — twice — came from a sequential upstream call composing past
+     nginx's proxy_read_timeout (see config.js's waitBudgetWarning). A burn
+     implementation that gets the right number via a second ethCallBatch, or
+     a Promise.all alongside this one, is wrong even though the figure would
+     be correct. Asserted on the calls ARRAY handed to ethCallBatch, not on
+     timing, so a future refactor into a second call fails this test
+     immediately rather than only under load. */
+  const batchCalls = []
+  const baseRpc = stubRpc()
+  const rpc = {
+    async ethCallBatch(calls, opts) {
+      batchCalls.push(calls)
+      return baseRpc.ethCallBatch(calls, opts)
+    },
+  }
+
+  const svc = createStatsService({
+    config: config(),
+    rpc,
+    fetchImpl: stubFetch(HAPPY_ROUTES),
+  })
+
+  await svc.collect()
+
+  assert.ok(batchCalls.length >= 1, 'expected at least one ethCallBatch call')
+  const firstBatchData = batchCalls[0].map((c) => c.data)
+
+  assert.ok(
+    firstBatchData.includes(SELECTORS.totalSupply),
+    'the first batch must still carry totalSupply',
+  )
+  assert.ok(
+    firstBatchData.includes(DEAD_CALL_DATA),
+    'the dead-address balanceOf must ride the SAME batch as totalSupply',
+  )
+  assert.ok(
+    firstBatchData.includes(ZERO_CALL_DATA),
+    'the zero-address balanceOf must ride the SAME batch as totalSupply',
+  )
+})
+
+test('with POOL_ADDRESS unset (the production configuration), the burn reads still ride the single batch', async () => {
+  /* Production runs with POOL_ADDRESS unset — the pool is Uniswap v4 and this
+     reader only prices v3 (see the comment in collect()). The pool branch in
+     readChain appends its three calls conditionally, so the burn calls'
+     indices must be correct in both shapes. Assert the whole call list, not
+     just membership, so an index slip (e.g. a burn call accidentally reusing
+     an index the decimals() read occupies) fails here instead of surfacing
+     as a silently wrong figure in production. */
+  const batchCalls = []
+  const baseRpc = stubRpc()
+  const rpc = {
+    async ethCallBatch(calls, opts) {
+      batchCalls.push(calls)
+      return baseRpc.ethCallBatch(calls, opts)
+    },
+  }
+
+  const svc = createStatsService({
+    config: config({ POOL_ADDRESS: '' }),
+    rpc,
+    fetchImpl: stubFetch(HAPPY_ROUTES),
+  })
+
+  const stats = await svc.collect()
+
+  assert.equal(batchCalls.length, 1, 'no pool means no follow-up batch either')
+  assert.deepEqual(
+    batchCalls[0].map((c) => c.data),
+    [SELECTORS.totalSupply, SELECTORS.decimals, DEAD_CALL_DATA, ZERO_CALL_DATA],
+  )
+  assert.equal(stats.burned, 30_436_764)
+  assert.ok(Math.abs(stats.burnedPct - 3.0436764) < 1e-6)
+})
+
+test('a failed burn read degrades burned/burnedPct to null without touching marketCap or holders', async () => {
+  /* Truncated returndata (not an Error thrown from ethCallBatch itself) so
+     only the burn-word DECODE fails — totalSupply and decimals, decoded
+     earlier in readChain, already succeeded by the time this is reached.
+     Mirrors exactly how marketCap already degrades when price is
+     unavailable: burn is additive information, not something worth trading
+     the headline figures for. */
+  const svc = createStatsService({
+    config: config(),
+    rpc: stubRpc({
+      overrides: {
+        [`${TOKEN_ADDRESS}:${DEAD_CALL_DATA}`]: '0x1234',
+      },
+    }),
+    fetchImpl: stubFetch(HAPPY_ROUTES),
+  })
+
+  const stats = await svc.collect()
+
+  assert.equal(stats.burned, null)
+  assert.equal(stats.burnedPct, null)
+  assert.ok(
+    stats.warnings.some((w) => w.includes('burn read failed')),
+    `expected a burn warning, got ${JSON.stringify(stats.warnings)}`,
+  )
+  assert.ok(Math.abs(stats.marketCap - EXPECTED_MCAP) < 0.01, 'market cap must survive')
+  assert.equal(stats.holders, 126, 'holders must survive')
+})
+
+test('guards the burnedPct division: zero supply yields null, not Infinity or NaN', async () => {
+  const svc = createStatsService({
+    config: config(),
+    rpc: stubRpc({
+      overrides: {
+        [`${TOKEN_ADDRESS}:${SELECTORS.totalSupply}`]: '0x' + '0'.repeat(64),
+      },
+    }),
+    fetchImpl: stubFetch(HAPPY_ROUTES),
+  })
+
+  const stats = await svc.collect()
+
+  assert.equal(stats.totalSupply, 0)
+  /* assert/strict's equal() is strictEqual: Infinity and NaN both fail this,
+     only an actual null passes. */
+  assert.equal(stats.burnedPct, null)
+  assert.equal(stats.burned, 30_436_764, 'burned itself is still a real figure')
 })
 
 test('emits the exact field names the frontend normalise() reads', async () => {

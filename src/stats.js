@@ -10,24 +10,53 @@
  * make buying decisions on it.
  */
 
-import { SELECTORS, decodeUint, decodeUint8, decodeAddress } from './chain/abi.js'
+import {
+  SELECTORS,
+  decodeUint,
+  decodeUint8,
+  decodeAddress,
+  encodeBalanceOf,
+} from './chain/abi.js'
 import { priceFromSqrtX96, toWholeTokens } from './chain/uniswapV3.js'
 import * as blockscout from './sources/blockscout.js'
 import * as dexscreener from './sources/dexscreener.js'
 
+/* The two conventional burn sinks. Summed because a plain ERC-20 with no
+   burn() has no other way to remove tokens from supply — see the design doc's
+   on-chain probe. 0x0 holds nothing for this token today, but the read is
+   free (one more slot in the batch already being sent) and skipping it would
+   silently miss a transfer there. */
+const DEAD_ADDRESS = '0x000000000000000000000000000000000000dead'
+const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
+
 /**
- * Reads supply, decimals and — when a pool is configured — the pool price, in
- * as few round trips as possible.
+ * Reads supply, decimals, the burned balance and — when a pool is configured
+ * — the pool price, in as few round trips as possible.
  *
- * @returns {Promise<{supply: number, decimals: number, priceInWeth: number|null}>}
+ * @returns {Promise<{
+ *   supply: number,
+ *   decimals: number,
+ *   priceInWeth: number|null,
+ *   burned: number|null,
+ *   burnedPct: number|null,
+ *   burnWarning: string|null,
+ * }>}
  */
 async function readChain({ rpc, config, signal }) {
   const { tokenAddress, poolAddress, wethAddress } = config
 
+  /* The burn reads ride this same batch, not a second one: a sequential
+     upstream call composing past nginx's proxy_read_timeout is the exact
+     mistake that has taken /stats down before (see config.js's
+     waitBudgetWarning). Indices below are positional, so anything appended
+     after these four must count from here, not from the old length of two. */
   const calls = [
-    { to: tokenAddress, data: SELECTORS.totalSupply },
-    { to: tokenAddress, data: SELECTORS.decimals },
+    { to: tokenAddress, data: SELECTORS.totalSupply }, // 0
+    { to: tokenAddress, data: SELECTORS.decimals }, // 1
+    { to: tokenAddress, data: encodeBalanceOf(DEAD_ADDRESS) }, // 2
+    { to: tokenAddress, data: encodeBalanceOf(ZERO_ADDRESS) }, // 3
   ]
+  const poolCallsIndex = calls.length
   if (poolAddress) {
     calls.push(
       { to: poolAddress, data: SELECTORS.slot0 },
@@ -42,15 +71,33 @@ async function readChain({ rpc, config, signal }) {
   const decimals = decodeUint8(results[1])
   const supply = toWholeTokens(rawSupply, decimals)
 
+  /* Decoding the burn words is isolated from the totalSupply/decimals decode
+     above: those two already succeeded by the time we get here, so a bad
+     burn word (e.g. truncated returndata) must not take marketCap and
+     holders down with it. Caught here, not left to propagate, exactly so
+     collect() can still build a market cap from `supply`. */
+  let burned = null
+  let burnedPct = null
+  let burnWarning = null
+  try {
+    const rawDead = decodeUint(results[2])
+    const rawZero = decodeUint(results[3])
+    burned = toWholeTokens(rawDead + rawZero, decimals)
+    // Guard the division: a zero supply must not put Infinity/NaN in the JSON.
+    burnedPct = supply > 0 ? (burned / supply) * 100 : null
+  } catch (err) {
+    burnWarning = `burn read failed: ${err.message}`
+  }
+
   if (!poolAddress) {
-    return { supply, decimals, priceInWeth: null }
+    return { supply, decimals, priceInWeth: null, burned, burnedPct, burnWarning }
   }
 
   /* slot0 packs sqrtPriceX96 into the first word; the rest (tick, observation
      cardinalities, feeProtocol, unlocked) is not needed. */
-  const sqrtPriceX96 = decodeUint(results[2])
-  const token0 = decodeAddress(results[3])
-  const token1 = decodeAddress(results[4])
+  const sqrtPriceX96 = decodeUint(results[poolCallsIndex])
+  const token0 = decodeAddress(results[poolCallsIndex + 1])
+  const token1 = decodeAddress(results[poolCallsIndex + 2])
 
   const baseIsToken0 = token0 === tokenAddress
   if (!baseIsToken0 && token1 !== tokenAddress) {
@@ -83,7 +130,7 @@ async function readChain({ rpc, config, signal }) {
     baseIsToken0,
   })
 
-  return { supply, decimals, priceInWeth }
+  return { supply, decimals, priceInWeth, burned, burnedPct, burnWarning }
 }
 
 /**
@@ -112,6 +159,8 @@ export function createStatsService({ config, rpc, fetchImpl = fetch }) {
         holders: null,
         priceUsd: null,
         totalSupply: null,
+        burned: null,
+        burnedPct: null,
         placeholder: true,
         source: { price: 'none', holders: 'none' },
         warnings: ['TOKEN_ADDRESS is not set'],
@@ -190,11 +239,21 @@ export function createStatsService({ config, rpc, fetchImpl = fetch }) {
 
     if (marketCap == null) warnings.push('market cap could not be derived')
 
+    /* Degrades independently of marketCap/holders, exactly as the design
+       requires: a chain-read outage already produced the "chain read failed"
+       warning above, so this only fires for the narrower case of the chain
+       read succeeding while the burn words specifically failed to decode. */
+    const burned = chain?.burned ?? null
+    const burnedPct = chain?.burnedPct ?? null
+    if (chain && burned == null) warnings.push(chain.burnWarning)
+
     return {
       marketCap,
       holders,
       priceUsd,
       totalSupply,
+      burned,
+      burnedPct,
       placeholder: false,
       source: { price: priceSource, holders: holdersSource },
       warnings,

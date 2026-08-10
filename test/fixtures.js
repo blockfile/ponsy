@@ -57,6 +57,22 @@ export const DECIMALS_18_RETURNDATA =
 export const DECIMALS_6_RETURNDATA =
   '0x0000000000000000000000000000000000000000000000000000000000000006'
 
+/** The two conventional burn sinks. Mirrors the constants in src/stats.js. */
+export const DEAD_ADDRESS = '0x000000000000000000000000000000000000dead'
+export const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
+
+/**
+ * balanceOf(dead) -> 30,436,764 * 1e18, the verified on-chain figure captured
+ * in the design doc (2026-08-10): balanceOf(0x...dEaD) = 30,436,764, 3.0437%
+ * of the 1,000,000,000 totalSupply carried by TOTAL_SUPPLY_RETURNDATA above.
+ */
+export const DEAD_BALANCE_RETURNDATA =
+  '0x000000000000000000000000000000000000000000192d3c485938ff94f00000'
+
+/** balanceOf(0x0) -> 0. The zero address holds nothing for this token. */
+export const ZERO_BALANCE_RETURNDATA =
+  '0x0000000000000000000000000000000000000000000000000000000000000000'
+
 /** GET /api/v2/tokens/{addr}/counters */
 export const BLOCKSCOUT_COUNTERS = {
   token_holders_count: '126',

@@ -27,6 +27,8 @@ export const SELECTORS = Object.freeze({
   token0: '0x0dfe1681',
   /** UniswapV3Pool token1() -> address */
   token1: '0xd21220a7',
+  /** ERC-20 balanceOf(address) -> uint256 */
+  balanceOf: '0x70a08231',
 })
 
 /** Strips the 0x prefix, if present. */
@@ -81,4 +83,14 @@ export function decodeUint8(hex, index = 0) {
  */
 export function decodeAddress(hex, index = 0) {
   return '0x' + word(hex, index).slice(24).toLowerCase()
+}
+
+/**
+ * Encodes balanceOf(address) calldata: the selector followed by the address
+ * left-padded to a full 32-byte word. Lowercased because the padding is
+ * positional, not checksum-sensitive, and a mixed-case tail reads like it
+ * might matter.
+ */
+export function encodeBalanceOf(address) {
+  return SELECTORS.balanceOf + '000000000000000000000000' + address.slice(2).toLowerCase()
 }
