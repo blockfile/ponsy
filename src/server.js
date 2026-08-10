@@ -159,6 +159,66 @@ export function createServer({ config, statsService, quoteService, cache, logger
     }
   })
 
+  /* The burn total, on its own route.
+   *
+   * Everything here is already in /stats — this endpoint exists because the
+   * frontend asks for burn separately and on purpose: its own fetch, its own
+   * error, its own retry, so a burn problem shows one error chip instead of
+   * blanking the market-cap and holders chips beside it. Serving it from
+   * /stats would couple the two failure modes back together and throw that
+   * isolation away.
+   *
+   * It costs no extra work upstream. It reads the SAME cached value /stats
+   * reads, kept warm by the background refresher, so the two routes never
+   * disagree and burn adds no RPC call, no round trip, and no wait budget of
+   * its own — which is the property that matters on a server whose 504s have
+   * twice come from an extra sequential upstream call. */
+  app.get('/burn', async (req, res) => {
+    try {
+      const { value, stale, updatedAt } = await withDeadline(
+        cache.get(() => statsService.collect()),
+        config.statsWaitMs,
+        () => new StatsTimeoutError(`stats collection exceeded the ${config.statsWaitMs}ms wait budget`),
+      )
+
+      /* A null burn is a FAILED read, not a burn of zero — stats.js degrades
+         to null precisely so the two cannot be confused. Reporting it as 0
+         would put "0 tokens burned" on the site, which is both wrong and
+         unfalsifiable-looking. 503 instead, which is what the frontend's own
+         error chip and RETRY button are for. */
+      if (value?.burned == null) {
+        return res.status(503).json({
+          error: 'burn total unavailable',
+          detail: 'the on-chain burn balance could not be read',
+        })
+      }
+
+      res.setHeader(
+        'Cache-Control',
+        `public, max-age=${Math.floor(config.cacheTtlMs / 1000)}`,
+      )
+
+      res.json({
+        burned: value.burned,
+        burnedPct: value.burnedPct,
+        totalSupply: value.totalSupply,
+        stale,
+        updatedAt: new Date(updatedAt).toISOString(),
+      })
+    } catch (err) {
+      if (err instanceof StatsTimeoutError) {
+        logger.warn?.(`[burn] cold start: no cached value within ${config.statsWaitMs}ms`)
+        return res.status(503).json({
+          error: 'burn total warming up',
+          detail: 'no cached figures yet; try again shortly',
+        })
+      }
+
+      logger.error?.('[burn] failed:', err.message)
+      res.status(503).json({ error: 'burn total unavailable', detail: err.message })
+    }
+  })
+
   /* Never cached. A quote is a price with an expiry — serving a stale one from
      any layer is how a user signs a transaction for a number that no longer
      exists. Note this is the opposite of /stats, which is cached for 30s. */

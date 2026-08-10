@@ -57,6 +57,8 @@ const PAYLOAD = {
   holders: 126,
   priceUsd: 0.000003863,
   totalSupply: 1_000_000_000,
+  burned: 48_114_340.016757675,
+  burnedPct: 4.811434001675767,
   placeholder: false,
   source: { price: 'pool', holders: 'blockscout' },
   warnings: [],
@@ -523,4 +525,90 @@ test('GET /quote/status returns 400 with the reason when the service rejects', a
       assert.equal(res.headers.get('cache-control'), 'no-store')
     },
   )
+})
+
+
+/* GET /burn — the frontend fetches the burn total from its OWN endpoint on
+   purpose (see src/lib/stats.js in the site repo): its own fetch, its own
+   error chip, its own retry, so a burn problem cannot blank the market-cap
+   and holders chips beside it. These pin that contract from this side. */
+
+test('GET /burn returns the burn total', async () => {
+  await withServer({ config: CONFIG, collect: async () => PAYLOAD }, async (get) => {
+    const res = await get('/burn')
+    const body = await res.json()
+
+    assert.equal(res.status, 200)
+    assert.equal(body.burned, 48_114_340.016757675)
+    assert.equal(body.burnedPct, 4.811434001675767)
+    assert.equal(body.totalSupply, 1_000_000_000)
+    assert.equal(body.stale, false)
+    assert.ok(!Number.isNaN(Date.parse(body.updatedAt)))
+  })
+})
+
+/* The field name is the whole integration. The site reads `burned` (it also
+   accepts totalBurned/total_burned/burnedSupply, but `burned` is what this
+   serves) and renders a dash for anything it cannot find — a silent rename
+   here shows up as an empty chip, not an error. */
+test('GET /burn names the field `burned`, which is what the site reads', async () => {
+  await withServer({ config: CONFIG, collect: async () => PAYLOAD }, async (get) => {
+    const body = await (await get('/burn')).json()
+    assert.ok('burned' in body, 'the site keys on `burned`; renaming it blanks the chip')
+    assert.equal(typeof body.burned, 'number')
+  })
+})
+
+/* A null burn is a FAILED read, not a burn of zero. Serving 0 would put
+   "0 tokens burned" on the site as though it were a fact. 503 drives the
+   frontend's own error chip and RETRY instead. */
+test('GET /burn is 503 when the burn read failed, never 0', async () => {
+  const failed = { ...PAYLOAD, burned: null, burnedPct: null }
+  await withServer({ config: CONFIG, collect: async () => failed }, async (get) => {
+    const res = await get('/burn')
+    assert.equal(res.status, 503)
+    const body = await res.json()
+    assert.match(body.error, /burn/i)
+    assert.notEqual(body.burned, 0)
+  })
+})
+
+/* The isolation the site is designed around, verified from this side: a burn
+   failure must not touch market cap or holders. */
+test('a failed burn read leaves GET /stats fully intact', async () => {
+  const failed = { ...PAYLOAD, burned: null, burnedPct: null }
+  await withServer({ config: CONFIG, collect: async () => failed }, async (get) => {
+    assert.equal((await get('/burn')).status, 503)
+
+    const stats = await get('/stats')
+    const body = await stats.json()
+    assert.equal(stats.status, 200)
+    assert.equal(body.marketCap, 3863.26)
+    assert.equal(body.holders, 126)
+  })
+})
+
+/* /burn must add no upstream work: it reads the same cached value /stats
+   reads. This project's outages have both come from an extra sequential
+   upstream call, so a second collect() here would be the same mistake in a
+   new place. */
+test('GET /burn and GET /stats share one cached collect(), not two', async () => {
+  let collects = 0
+  const collect = async () => {
+    collects += 1
+    return PAYLOAD
+  }
+  await withServer({ config: CONFIG, collect }, async (get) => {
+    await get('/stats')
+    await get('/burn')
+    await get('/burn')
+    assert.equal(collects, 1, '/burn must reuse the cache, never collect again')
+  })
+})
+
+test('GET /burn sets Cache-Control matching the TTL', async () => {
+  await withServer({ config: CONFIG, collect: async () => PAYLOAD }, async (get) => {
+    const res = await get('/burn')
+    assert.match(res.headers.get('cache-control'), /max-age=30/)
+  })
 })
